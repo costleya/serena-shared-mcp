@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable
-from typing import Any, cast
+import uuid
+from collections.abc import Callable
+from typing import Any, Protocol, cast
 
 import anyio
 from mcp import Client
@@ -17,6 +18,7 @@ from mcp.shared.inbound import (
     encode_header_value,
 )
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
+from anyio.to_thread import run_sync as run_sync_in_worker_thread
 
 PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
 
@@ -71,43 +73,181 @@ def adapt_client_message(session_message: SessionMessage) -> SessionMessage:
     return SessionMessage(message, ClientMessageMetadata(headers=headers))
 
 
-async def _copy_messages(
-    source: AsyncIterable[SessionMessage | Exception],
-    destination: Any,
-    *,
-    adapt: bool,
+class ActivityLease(Protocol):
+    def request_started(self) -> None: ...
+
+    def request_finished(self) -> None: ...
+
+
+def message_method(item: SessionMessage) -> str | None:
+    method = getattr(item.message, "method", None)
+    return method if isinstance(method, str) else None
+
+
+def message_id(item: SessionMessage) -> int | str | None:
+    value = getattr(item.message, "id", None)
+    return value if isinstance(value, (int, str)) else None
+
+
+async def replay_initialization(
+    http_read: Any,
+    http_write: Any,
+    initialize: SessionMessage,
+    initialized: SessionMessage | None,
 ) -> None:
-    async for item in source:
-        if isinstance(item, Exception):
-            raise item
-        await destination.send(adapt_client_message(item) if adapt else item)
+    replay_id = f"serena-shared-replay-{uuid.uuid4().hex}"
+    replay_message = initialize.message.model_copy(update={"id": replay_id})
+    await http_write.send(
+        adapt_client_message(SessionMessage(replay_message, initialize.metadata))
+    )
+    while True:
+        response = await http_read.receive()
+        if isinstance(response, Exception):
+            raise response
+        if message_id(response) == replay_id:
+            break
+    if initialized is not None:
+        await http_write.send(adapt_client_message(initialized))
 
 
-async def bridge_stdio_async(endpoint: str) -> None:
-    """Relay one stdio connection to one independent upstream HTTP connection."""
+async def bridge_stdio_async(
+    endpoint_provider: Callable[[], tuple[str, int]],
+    identity_provider: Callable[[], tuple[str, int] | None],
+    lease: ActivityLease,
+) -> None:
+    """Relay stdio while reconnecting an automatically reaped HTTP backend."""
     async with stdio_server() as (stdio_read, stdio_write):
-        async with streamable_http_client(endpoint, terminate_on_close=True) as streams:
-            http_read, http_write = streams
-            async with anyio.create_task_group() as group:
-                async def run_copy(source: Any, destination: Any, *, adapt: bool) -> None:
+        queued_send, queued_receive = anyio.create_memory_object_stream[SessionMessage](100)
+        initialize: SessionMessage | None = None
+        initialized: SessionMessage | None = None
+        pending: set[int | str] = set()
+        stdio_closed = False
+
+        async def read_stdio() -> None:
+            nonlocal initialize, initialized, stdio_closed
+            try:
+                async for item in stdio_read:
+                    if isinstance(item, Exception):
+                        raise item
+                    method = message_method(item)
+                    if method in ("initialize", "server/discover"):
+                        initialize = item
+                    elif method == "notifications/initialized":
+                        initialized = item
+                    request_id = message_id(item)
+                    if method is not None and request_id is not None:
+                        lease.request_started()
+                        pending.add(request_id)
+                    await queued_send.send(item)
+            finally:
+                stdio_closed = True
+                await queued_send.aclose()
+
+        async def relay_connections() -> None:
+            first_connection = True
+            async with queued_receive:
+                try:
+                    first = await queued_receive.receive()
+                except anyio.EndOfStream:
+                    return
+                while True:
+                    endpoint, generation = await run_sync_in_worker_thread(
+                        endpoint_provider
+                    )
+                    backend_closed = False
+                    client_closed = False
+                    reconnect_item: SessionMessage | None = None
                     try:
-                        await _copy_messages(source, destination, adapt=adapt)
-                    finally:
-                        group.cancel_scope.cancel()
+                        async with streamable_http_client(
+                            endpoint, terminate_on_close=True
+                        ) as streams:
+                            http_read, http_write = streams
+                            if not first_connection:
+                                if initialize is None:
+                                    raise RuntimeError(
+                                        "Cannot restart Serena before MCP initialization."
+                                    )
+                                await replay_initialization(
+                                    http_read, http_write, initialize, initialized
+                                )
+                            first_connection = False
+                            await http_write.send(adapt_client_message(first))
 
-                async def client_to_http() -> None:
-                    await run_copy(stdio_read, http_write, adapt=True)
+                            async with anyio.create_task_group() as group:
+                                async def client_to_http() -> None:
+                                    nonlocal client_closed, reconnect_item
+                                    try:
+                                        async for item in queued_receive:
+                                            current = await run_sync_in_worker_thread(
+                                                identity_provider
+                                            )
+                                            if current != (endpoint, generation):
+                                                reconnect_item = item
+                                                group.cancel_scope.cancel()
+                                                return
+                                            await http_write.send(adapt_client_message(item))
+                                        client_closed = True
+                                    finally:
+                                        group.cancel_scope.cancel()
 
-                async def http_to_client() -> None:
-                    await run_copy(http_read, stdio_write, adapt=False)
+                                async def http_to_client() -> None:
+                                    nonlocal backend_closed
+                                    try:
+                                        async for item in http_read:
+                                            if isinstance(item, Exception):
+                                                raise item
+                                            response_id = message_id(item)
+                                            if response_id in pending:
+                                                pending.remove(response_id)
+                                                lease.request_finished()
+                                            await stdio_write.send(item)
+                                    finally:
+                                        backend_closed = True
+                                        group.cancel_scope.cancel()
 
-                group.start_soon(client_to_http)
-                group.start_soon(http_to_client)
+                                group.start_soon(client_to_http)
+                                group.start_soon(http_to_client)
+                    except Exception:
+                        if pending or not backend_closed:
+                            raise
+                    if client_closed or stdio_closed:
+                        return
+                    if reconnect_item is not None:
+                        first = reconnect_item
+                        continue
+                    if pending:
+                        raise RuntimeError(
+                            "Serena disconnected while requests were in flight."
+                        )
+                    try:
+                        first = await queued_receive.receive()
+                    except anyio.EndOfStream:
+                        return
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(read_stdio)
+            group.start_soon(relay_connections)
 
 
-def bridge_stdio(endpoint: str) -> None:
+def bridge_stdio(
+    endpoint_provider: Callable[[], tuple[str, int]],
+    identity_provider: Callable[[], tuple[str, int] | None],
+    lease: ActivityLease,
+) -> None:
     try:
-        anyio.run(bridge_stdio_async, endpoint)
+        anyio.run(
+            bridge_stdio_async, endpoint_provider, identity_provider, lease
+        )
     except* Exception as group:
-        messages = "; ".join(str(error) for error in group.exceptions if str(error))
+        def messages_for(error: BaseException) -> list[str]:
+            if isinstance(error, BaseExceptionGroup):
+                typed_group = cast(BaseExceptionGroup[BaseException], error)
+                return [
+                    message
+                    for item in typed_group.exceptions
+                    for message in messages_for(item)
+                ]
+            return [str(error)] if str(error) else []
+
+        messages = "; ".join(messages_for(group))
         raise RuntimeError(messages or "MCP transport bridge failed.") from group

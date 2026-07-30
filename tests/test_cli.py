@@ -25,3 +25,25 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
     except SystemExit as error:
         assert error.code == 0
     assert "serena-shared 0.1.0" in capsys.readouterr().out
+
+
+def test_proxy_timeout_defaults_to_fifteen_minutes() -> None:
+    arguments = cli.parser().parse_args(["proxy"])
+    assert arguments.idle_timeout_minutes == 15
+
+
+def test_proxy_timeout_accepts_positive_integer_minutes() -> None:
+    arguments = cli.parser().parse_args(["proxy", "--idle-timeout-minutes", "45"])
+    assert arguments.idle_timeout_minutes == 45
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "later"])
+def test_proxy_timeout_rejects_invalid_minutes(value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["proxy", "--idle-timeout-minutes", value])
+
+
+@pytest.mark.parametrize("command", ["stop", "gc"])
+def test_removed_maintenance_commands_are_rejected(command: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args([command])

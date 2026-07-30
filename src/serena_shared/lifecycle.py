@@ -10,13 +10,15 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable, Generator, TypeGuard
+from typing import Any, Callable, Generator, Mapping, NotRequired, Sequence, TypeGuard, TypedDict
 
 PORT_START = 9121
 PORT_END = 9199
@@ -24,6 +26,7 @@ LOCK_WAIT_SECONDS = 30.0
 STARTUP_TIMEOUT_SECONDS = 15.0
 TERMINATION_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
+WATCHDOG_POLL_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +43,44 @@ class StatePaths:
     port_lock: Path
     log: Path
     record: Path
+
+    def lease(self, lease_id: str) -> Path:
+        return self.base_dir / f"{self.key}.{lease_id}.lease.json"
+
+
+class ProcessFingerprint(TypedDict):
+    pid: int
+    startedAt: str
+    command: str
+
+
+class WatchdogRecord(TypedDict):
+    pid: int
+    process: ProcessFingerprint
+
+
+class SerenaRecord(TypedDict):
+    root: str
+    pid: int
+    port: int
+    endpoint: str
+    log: str
+    process: ProcessFingerprint | None
+    fingerprintAvailable: bool
+    state: str
+    watchdog: NotRequired[WatchdogRecord]
+
+
+class IdleState(TypedDict):
+    idleTimeoutMinutes: int
+    lastActivityAt: float
+    inFlight: int
+
+
+class LeaseRecord(IdleState):
+    root: str
+    pid: int
+    process: ProcessFingerprint
 
 
 def hash_checkout_path(checkout: Path | str) -> str:
@@ -64,8 +105,8 @@ def paths_for_checkout(common_git_dir: Path | str, checkout: Path | str) -> Stat
     )
 
 
-def orphan_record_path(paths: StatePaths, pid: int) -> Path:
-    return paths.base_dir / f"{paths.key}.{pid}.orphan.json"
+def lease_paths(paths: StatePaths) -> list[Path]:
+    return sorted(paths.base_dir.glob(f"{paths.key}.*.lease.json"))
 
 
 def default_context_path() -> Path:
@@ -96,7 +137,7 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def write_json_atomically(path: Path, value: dict[str, Any]) -> None:
+def write_json_atomically(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary)
@@ -131,7 +172,7 @@ def file_lock(path: Path, timeout: float = LOCK_WAIT_SECONDS) -> Generator[None,
         os.close(descriptor)
 
 
-def process_fingerprint(pid: int) -> dict[str, Any] | None:
+def process_fingerprint(pid: int) -> ProcessFingerprint | None:
     completed = subprocess.run(
         ["ps", "-ww", "-p", str(pid), "-o", "pid=", "-o", "lstart=", "-o", "command="],
         text=True,
@@ -156,7 +197,14 @@ def is_process_alive(pid: int) -> bool:
         pass
     try:
         os.kill(pid, 0)
-        return True
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        state = completed.stdout.strip()
+        return not state.startswith("Z") if completed.returncode == 0 and state else True
     except PermissionError:
         return True
     except (ProcessLookupError, ValueError, TypeError):
@@ -179,7 +227,7 @@ def is_same_process_fingerprint(actual: Any, expected: Any) -> bool:
 
 def is_registry_record_for_checkout(
     record: Any, checkout: Path | str
-) -> TypeGuard[dict[str, Any]]:
+) -> TypeGuard[SerenaRecord]:
     return bool(
         is_json_object(record)
         and record.get("root") == os.fspath(checkout)
@@ -205,14 +253,29 @@ def is_serena_fingerprint(fingerprint: Any, record: Any) -> bool:
     )
 
 
-def has_matching_record_fingerprint(record: dict[str, Any]) -> bool:
+def has_matching_record_fingerprint(record: SerenaRecord) -> bool:
     actual = process_fingerprint(record["pid"])
     return actual is None or is_serena_fingerprint(actual, record)
 
 
-def is_owned_serena(record: dict[str, Any]) -> bool:
-    pid = record.get("pid")
-    return isinstance(pid, int) and is_serena_fingerprint(process_fingerprint(pid), record)
+def is_owned_serena(record: SerenaRecord) -> bool:
+    return is_serena_fingerprint(process_fingerprint(record["pid"]), record)
+
+
+def is_live_lease(record: Any, checkout: Path | str) -> TypeGuard[LeaseRecord]:
+    if not (
+        is_json_object(record)
+        and record.get("root") == os.fspath(checkout)
+        and isinstance(record.get("pid"), int)
+        and isinstance(record.get("idleTimeoutMinutes"), int)
+        and record["idleTimeoutMinutes"] > 0
+        and isinstance(record.get("lastActivityAt"), (int, float))
+        and isinstance(record.get("inFlight"), int)
+        and record["inFlight"] >= 0
+    ):
+        return False
+    actual = process_fingerprint(record["pid"])
+    return actual is not None and is_same_process_fingerprint(actual, record.get("process"))
 
 
 def find_available_port(excluded: set[int] | None = None) -> int:
@@ -236,9 +299,9 @@ def create_serena_record(
     log: Path,
     pid: int,
     port: int,
-    process: dict[str, Any] | None,
+    process: ProcessFingerprint | None,
     state: str,
-) -> dict[str, Any]:
+) -> SerenaRecord:
     return {
         "root": os.fspath(checkout),
         "pid": pid,
@@ -283,7 +346,7 @@ def start_serena(checkout: Path, port: int, context: Path, log: Path) -> int:
         stream.close()
 
 
-def terminate_verified_serena(record: dict[str, Any]) -> bool:
+def terminate_verified_serena(record: SerenaRecord) -> bool:
     if not is_owned_serena(record):
         return False
     try:
@@ -302,7 +365,7 @@ def terminate_verified_serena(record: dict[str, Any]) -> bool:
 
 def contain_spawned_serena(
     *, checkout: Path, endpoint: str, log: Path, paths: StatePaths, pid: int,
-    port: int, process: dict[str, Any] | None, record_path: Path, state: str
+    port: int, process: ProcessFingerprint | None, record_path: Path, state: str
 ) -> tuple[bool, bool]:
     record = create_serena_record(checkout, endpoint, log, pid, port, process, state)
     if process and terminate_verified_serena(record):
@@ -318,7 +381,7 @@ def start_shared_serena(
     common_git_dir: Path,
     probe: Callable[[str], bool],
     context: Path | None = None,
-) -> dict[str, Any]:
+) -> SerenaRecord:
     paths = paths_for_checkout(common_git_dir, checkout)
     context = default_context_path() if context is None else context
     with file_lock(paths.startup_lock):
@@ -332,11 +395,11 @@ def start_shared_serena(
             elif is_process_alive(existing["pid"]):
                 if existing.get("state") == "pending":
                     actual = process_fingerprint(existing["pid"])
-                    candidate: dict[str, Any] = (
+                    candidate: SerenaRecord = (
                         existing if existing.get("process") else {**existing, "process": actual}
                     )
                     if ((actual and is_serena_fingerprint(actual, candidate)) or actual is None) and probe(existing["endpoint"]):
-                        active: dict[str, Any] = {
+                        active: SerenaRecord = {
                             **existing,
                             "process": actual or existing.get("process"),
                             "state": "active",
@@ -361,7 +424,7 @@ def start_shared_serena(
                 attempted.add(port)
                 endpoint = endpoint_for_port(port)
                 pid: int | None = None
-                fingerprint: dict[str, Any] | None = None
+                fingerprint: ProcessFingerprint | None = None
                 try:
                     pid = start_serena(checkout, port, context, paths.log)
                     initial = process_fingerprint(pid)
@@ -422,12 +485,175 @@ def start_shared_serena(
             raise RuntimeError(f"Shared Serena did not become healthy. See {paths.log}.")
 
 
-def ensure_shared_serena(probe: Callable[[str], bool], cwd: Path | str | None = None) -> dict[str, Any]:
+def start_watchdog(checkout: Checkout, paths: StatePaths) -> WatchdogRecord:
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "serena_shared.cli",
+            "__watchdog",
+            os.fspath(checkout.root),
+            os.fspath(checkout.common_git_dir),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    fingerprint = process_fingerprint(child.pid)
+    if fingerprint is None:
+        raise RuntimeError("Shared Serena watchdog fingerprint could not be verified.")
+    return {"pid": child.pid, "process": fingerprint}
+
+
+def is_live_watchdog(value: Any) -> bool:
+    if not is_json_object(value) or not isinstance(value.get("pid"), int):
+        return False
+    actual = process_fingerprint(value["pid"])
+    return actual is not None and is_same_process_fingerprint(actual, value.get("process"))
+
+
+def ensure_watchdog(checkout: Checkout, paths: StatePaths) -> SerenaRecord:
+    with file_lock(paths.startup_lock):
+        record = read_json(paths.record)
+        if not is_registry_record_for_checkout(record, checkout.root):
+            raise RuntimeError(f"No verified shared Serena server exists for {checkout.root}.")
+        if is_live_watchdog(record.get("watchdog")):
+            return record
+        watchdog = start_watchdog(checkout, paths)
+        updated: SerenaRecord = {**record, "watchdog": watchdog}
+        write_json_atomically(paths.record, updated)
+        return updated
+
+
+def ensure_backend(
+    checkout: Checkout, paths: StatePaths, probe: Callable[[str], bool]
+) -> SerenaRecord:
+    record = start_shared_serena(
+        checkout.root, checkout.common_git_dir, probe, default_context_path()
+    )
+    return ensure_watchdog(checkout, paths) if not is_live_watchdog(record.get("watchdog")) else record
+
+
+def backend_identity(paths: StatePaths, checkout: Path) -> tuple[str, int] | None:
+    record = read_json(paths.record)
+    if not is_registry_record_for_checkout(record, checkout):
+        return None
+    if not is_process_alive(record["pid"]) or not has_matching_record_fingerprint(record):
+        return None
+    return record["endpoint"], record["pid"]
+
+
+@dataclass(slots=True)
+class ProxyLease:
+    checkout: Checkout
+    paths: StatePaths
+    path: Path
+
+    def _update(self, *, started: bool = False, finished: bool = False) -> None:
+        with file_lock(self.paths.startup_lock):
+            record = read_json(self.path)
+            if not is_json_object(record):
+                raise RuntimeError("Shared Serena proxy lease disappeared.")
+            in_flight = int(record.get("inFlight", 0))
+            if started:
+                in_flight += 1
+            if finished:
+                in_flight = max(0, in_flight - 1)
+            write_json_atomically(
+                self.path,
+                {
+                    **record,
+                    "inFlight": in_flight,
+                    "lastActivityAt": time.time(),
+                },
+            )
+
+    def request_started(self) -> None:
+        self._update(started=True)
+
+    def request_finished(self) -> None:
+        self._update(finished=True)
+
+    def close(self) -> None:
+        with file_lock(self.paths.startup_lock):
+            self.path.unlink(missing_ok=True)
+
+
+def create_proxy_lease(
+    idle_timeout_minutes: int, cwd: Path | str | None = None
+) -> ProxyLease:
+    if idle_timeout_minutes <= 0:
+        raise ValueError("Idle timeout minutes must be a positive integer.")
     checkout = resolve_checkout(cwd)
-    context = default_context_path()
-    if not context.exists():
-        raise RuntimeError(f"Shared Serena context does not exist: {context}")
-    return start_shared_serena(checkout.root, checkout.common_git_dir, probe, context)
+    paths = paths_for_checkout(checkout.common_git_dir, checkout.root)
+    fingerprint = process_fingerprint(os.getpid())
+    if fingerprint is None:
+        raise RuntimeError("Shared Serena proxy fingerprint could not be verified.")
+    path = paths.lease(uuid.uuid4().hex)
+    with file_lock(paths.startup_lock):
+        write_json_atomically(
+            path,
+            {
+                "root": os.fspath(checkout.root),
+                "pid": os.getpid(),
+                "process": fingerprint,
+                "idleTimeoutMinutes": idle_timeout_minutes,
+                "lastActivityAt": time.time(),
+                "inFlight": 0,
+            },
+        )
+    return ProxyLease(checkout, paths, path)
+
+
+def inspect_leases(
+    paths: StatePaths, checkout: Path, *, remove_stale: bool = True
+) -> tuple[list[LeaseRecord], int]:
+    live: list[LeaseRecord] = []
+    removed = 0
+    for path in lease_paths(paths):
+        record = read_json(path)
+        if is_live_lease(record, checkout):
+            live.append(record)
+        elif remove_stale:
+            path.unlink(missing_ok=True)
+            removed += 1
+    return live, removed
+
+
+def idle_shutdown_due(leases: Sequence[IdleState], now: float) -> bool:
+    return not leases or all(
+        lease["inFlight"] == 0
+        and now - lease["lastActivityAt"] >= lease["idleTimeoutMinutes"] * 60
+        for lease in leases
+    )
+
+
+def run_watchdog(
+    checkout_root: Path | str,
+    common_git_dir: Path | str,
+    *,
+    poll_seconds: float = WATCHDOG_POLL_SECONDS,
+) -> None:
+    checkout = Checkout(Path(checkout_root), Path(common_git_dir))
+    paths = paths_for_checkout(checkout.common_git_dir, checkout.root)
+    while True:
+        with file_lock(paths.startup_lock):
+            record = read_json(paths.record)
+            if not is_registry_record_for_checkout(record, checkout.root):
+                return
+            if not is_process_alive(record["pid"]):
+                paths.record.unlink(missing_ok=True)
+                return
+            leases, _ = inspect_leases(paths, checkout.root)
+            now = time.time()
+            root_exists = checkout.root.exists()
+            idle = idle_shutdown_due(leases, now)
+            if (not root_exists or idle) and terminate_verified_serena(record):
+                paths.record.unlink(missing_ok=True)
+                return
+        time.sleep(poll_seconds)
 
 
 def status(probe: Callable[[str], bool], cwd: Path | str | None = None) -> tuple[bool, dict[str, Any]]:
@@ -440,67 +666,30 @@ def status(probe: Callable[[str], bool], cwd: Path | str | None = None) -> tuple
             and has_matching_record_fingerprint(record)
             and probe(record["endpoint"])
         )
-    return healthy, {"checkout": os.fspath(checkout.root), "healthy": healthy, "record": record}
-
-
-def stop_current_checkout(cwd: Path | str | None = None) -> tuple[bool, str]:
-    checkout = resolve_checkout(cwd)
     paths = paths_for_checkout(checkout.common_git_dir, checkout.root)
-    with file_lock(paths.startup_lock):
-        record = read_json(paths.record)
-        if not record:
-            return False, f"No shared Serena server is registered for {checkout.root}."
-        if not is_registry_record_for_checkout(record, checkout.root):
-            return False, f"Refused to stop an unverified process for {checkout.root}."
-        stopped = terminate_verified_serena(record)
-        if stopped or not is_process_alive(record["pid"]):
-            paths.record.unlink(missing_ok=True)
-        message = (
-            f"Stopped shared Serena for {checkout.root}."
-            if stopped
-            else f"Refused to stop an unverified process for {checkout.root}."
+    leases, _ = inspect_leases(paths, checkout.root, remove_stale=False)
+    now = time.time()
+    next_shutdown = (
+        None
+        if any(lease["inFlight"] for lease in leases)
+        else max(
+            (
+                lease["lastActivityAt"] + lease["idleTimeoutMinutes"] * 60
+                for lease in leases
+            ),
+            default=None,
         )
-        return stopped, message
-
-
-def collect_stale_servers(cwd: Path | str | None = None) -> list[dict[str, Any]]:
-    checkout = resolve_checkout(cwd)
-    base = checkout.common_git_dir / "serena-shared"
-    results: list[dict[str, Any]] = []
-    if not base.exists():
-        return results
-    for path in sorted(base.glob("*.json")):
-        key = path.name.split(".", 1)[0]
-        with file_lock(base / f"{key}.startup.flock"):
-            record = read_json(path)
-            if not record:
-                continue
-            if not is_json_object(record):
-                continue
-            root = record.get("root")
-            pid = record.get("pid")
-            root_exists = isinstance(root, str) and Path(root).exists()
-            alive = isinstance(pid, int) and is_process_alive(pid)
-            owned = is_owned_serena(record)
-            if record.get("state") == "orphan":
-                if not alive:
-                    path.unlink(missing_ok=True)
-                    results.append({"path": os.fspath(path), "removed": True, "stopped": False})
-                elif owned:
-                    stopped = terminate_verified_serena(record)
-                    if stopped:
-                        path.unlink(missing_ok=True)
-                    results.append({"path": os.fspath(path), "removed": stopped, "stopped": stopped})
-                else:
-                    results.append({"path": os.fspath(path), "removed": False, "stopped": False, "skipped": "unverified-live-process"})
-            elif not alive:
-                path.unlink(missing_ok=True)
-                results.append({"path": os.fspath(path), "removed": True, "stopped": False})
-            elif not root_exists and owned:
-                stopped = terminate_verified_serena(record)
-                if stopped:
-                    path.unlink(missing_ok=True)
-                results.append({"path": os.fspath(path), "removed": stopped, "stopped": stopped})
-            elif not root_exists:
-                results.append({"path": os.fspath(path), "removed": False, "stopped": False, "skipped": "unverified-live-process"})
-    return results
+    )
+    activity = {
+        "liveProxies": len(leases),
+        "inFlight": sum(lease["inFlight"] for lease in leases),
+        "lastActivityAt": max((lease["lastActivityAt"] for lease in leases), default=None),
+        "nextShutdownAt": next_shutdown if next_shutdown is None or next_shutdown > now else now,
+        "watchdogHealthy": bool(record and is_live_watchdog(record.get("watchdog"))),
+    }
+    return healthy, {
+        "checkout": os.fspath(checkout.root),
+        "healthy": healthy,
+        "record": record,
+        "activity": activity,
+    }

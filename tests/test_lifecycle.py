@@ -19,7 +19,7 @@ def test_paths_are_worktree_specific_and_share_port_lock(tmp_path: Path) -> None
     assert first.record != second.record
     assert first.port_lock == second.port_lock
     assert lifecycle.endpoint_for_port(9121) == "http://127.0.0.1:9121/mcp"
-    assert lifecycle.orphan_record_path(first, 42).name.endswith(".42.orphan.json")
+    assert first.lease("client").name.endswith(".client.lease.json")
 
 
 def test_resolve_checkout_distinguishes_linked_worktrees(tmp_path: Path) -> None:
@@ -106,6 +106,24 @@ def test_process_liveness_reaps_owned_child(monkeypatch: pytest.MonkeyPatch) -> 
     assert not lifecycle.is_process_alive(123)
 
 
+def test_process_liveness_treats_non_child_zombie_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def non_child_waitpid(_pid: int, _options: int) -> NoReturn:
+        raise ChildProcessError
+
+    def permitted_kill(_pid: int, _signal: int) -> None:
+        return None
+
+    def zombie_status(args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, "Z+\n", "")
+
+    monkeypatch.setattr(lifecycle.os, "waitpid", non_child_waitpid)
+    monkeypatch.setattr(lifecycle.os, "kill", permitted_kill)
+    monkeypatch.setattr(lifecycle.subprocess, "run", zombie_status)
+    assert not lifecycle.is_process_alive(123)
+
+
 def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -178,31 +196,117 @@ def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: p
     assert lifecycle.read_json(paths.record) is None
 
 
-def test_gc_removes_dead_and_retains_unverified_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inspect_leases_removes_dead_and_retains_verified_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     checkout = tmp_path / "checkout"
     git = checkout / ".git"
     git.mkdir(parents=True)
     paths = lifecycle.paths_for_checkout(git, checkout)
-    dead = paths.base_dir / "dead.json"
-    orphan = paths.base_dir / "orphan.json"
-    lifecycle.write_json_atomically(dead, {"root": str(checkout), "pid": 1, "state": "active"})
-    lifecycle.write_json_atomically(orphan, {"root": str(checkout), "pid": 2, "state": "orphan"})
-    def resolve_checkout(_cwd: Path | str | None = None) -> lifecycle.Checkout:
-        return lifecycle.Checkout(checkout, git)
+    process = {"pid": 2, "startedAt": "now", "command": "serena-shared proxy"}
+    dead = paths.lease("dead")
+    live = paths.lease("live")
+    base = {
+        "root": str(checkout),
+        "idleTimeoutMinutes": 15,
+        "lastActivityAt": 100.0,
+        "inFlight": 0,
+    }
+    lifecycle.write_json_atomically(dead, {**base, "pid": 1, "process": None})
+    lifecycle.write_json_atomically(live, {**base, "pid": 2, "process": process})
+    def fingerprint_for_live_proxy(pid: int) -> dict[str, int | str] | None:
+        return process if pid == 2 else None
 
-    def process_is_alive(pid: int) -> bool:
-        return pid == 2
-
-    def is_owned_serena(_record: dict[str, Any]) -> bool:
-        return False
-
-    monkeypatch.setattr(lifecycle, "resolve_checkout", resolve_checkout)
-    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
-    monkeypatch.setattr(lifecycle, "is_owned_serena", is_owned_serena)
-    results = lifecycle.collect_stale_servers(checkout)
+    monkeypatch.setattr(lifecycle, "process_fingerprint", fingerprint_for_live_proxy)
+    leases, removed = lifecycle.inspect_leases(paths, checkout)
+    assert removed == 1
     assert not dead.exists()
-    assert orphan.exists()
-    assert {item.get("skipped") for item in results} == {None, "unverified-live-process"}
+    assert live.exists()
+    assert leases == [{**base, "pid": 2, "process": process}]
+
+
+def test_idle_shutdown_waits_for_every_timeout_and_in_flight_request() -> None:
+    leases: list[lifecycle.IdleState] = [
+        {"idleTimeoutMinutes": 15, "lastActivityAt": 0.0, "inFlight": 0},
+        {"idleTimeoutMinutes": 30, "lastActivityAt": 0.0, "inFlight": 0},
+    ]
+    assert not lifecycle.idle_shutdown_due(leases, 29 * 60)
+    assert lifecycle.idle_shutdown_due(leases, 30 * 60)
+    leases[0]["inFlight"] = 1
+    assert not lifecycle.idle_shutdown_due(leases, 60 * 60)
+
+
+def test_watchdog_stops_verified_idle_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git = tmp_path / "git"
+    paths = lifecycle.paths_for_checkout(git, checkout)
+    record = {
+        "root": str(checkout),
+        "pid": 42,
+        "port": 9121,
+        "endpoint": lifecycle.endpoint_for_port(9121),
+        "process": {"pid": 42},
+    }
+    lifecycle.write_json_atomically(paths.record, record)
+    def process_is_alive(_pid: int) -> bool:
+        return True
+
+    def terminate_record(value: dict[str, Any]) -> bool:
+        return value == record
+
+    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(lifecycle, "terminate_verified_serena", terminate_record)
+    lifecycle.run_watchdog(checkout, git, poll_seconds=0)
+    assert not paths.record.exists()
+
+
+def test_watchdog_stops_backend_for_deleted_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "deleted-checkout"
+    git = tmp_path / "git"
+    paths = lifecycle.paths_for_checkout(git, checkout)
+    record = {
+        "root": str(checkout),
+        "pid": 42,
+        "port": 9121,
+        "endpoint": lifecycle.endpoint_for_port(9121),
+        "process": {"pid": 42},
+    }
+    lifecycle.write_json_atomically(paths.record, record)
+    def process_is_alive(_pid: int) -> bool:
+        return True
+
+    def terminate_record(value: dict[str, Any]) -> bool:
+        return value == record
+
+    def active_lease(
+        _paths: lifecycle.StatePaths,
+        _checkout: Path,
+        *,
+        remove_stale: bool = True,
+    ) -> tuple[list[dict[str, Any]], int]:
+        del remove_stale
+        return [
+            {
+                "idleTimeoutMinutes": 15,
+                "lastActivityAt": time.time(),
+                "inFlight": 1,
+            }
+        ], 0
+
+    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(lifecycle, "terminate_verified_serena", terminate_record)
+    monkeypatch.setattr(
+        lifecycle,
+        "inspect_leases",
+        active_lease,
+    )
+    lifecycle.run_watchdog(checkout, git, poll_seconds=0)
+    assert not paths.record.exists()
 
 
 def test_status_shape_without_server(tmp_path: Path) -> None:
@@ -211,4 +315,15 @@ def test_status_shape_without_server(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     healthy, output = lifecycle.status(lambda endpoint: False, checkout)
     assert not healthy
-    assert output == {"checkout": str(checkout.resolve()), "healthy": False, "record": None}
+    assert output == {
+        "checkout": str(checkout.resolve()),
+        "healthy": False,
+        "record": None,
+        "activity": {
+            "liveProxies": 0,
+            "inFlight": 0,
+            "lastActivityAt": None,
+            "nextShutdownAt": None,
+            "watchdogHealthy": False,
+        },
+    }

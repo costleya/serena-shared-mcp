@@ -43,11 +43,15 @@ checkout:
 ```json
 {
   "command": "serena-shared",
-  "args": ["proxy"]
+  "args": ["proxy", "--idle-timeout-minutes", "15"]
 }
 ```
 
-`proxy` is the default command, so an empty argument list is equivalent.
+`proxy` is the default command, and the idle timeout defaults to 15 minutes, so
+an empty argument list is equivalent. The lightweight stdio proxy stays
+connected, while the heavier Serena and language-server processes stop after
+the configured period without completed requests. A later request starts and
+reinitializes Serena transparently.
 
 ## MCP version compatibility
 
@@ -61,19 +65,16 @@ SDK 1.28.1. The bridge uses the v2 client's automatic negotiation and fallback
 so it works with that Serena release while remaining ready for Serena servers
 that use MCP SDK v2.
 
-## Maintenance
+## Status
 
 ```sh
 serena-shared status
-serena-shared stop
-serena-shared gc
 ```
 
-- `status` reports the current checkout's registry record and health.
-- `stop` signals only a process whose PID, start time, command, checkout, and
-  port match the stored record.
-- `gc` removes dead records and safely handles verified orphan processes and
-  records for deleted worktrees.
+`status` reports the current checkout's registry record, health, live proxy and
+in-flight request counts, next idle shutdown, and watchdog health. Process and
+state cleanup is automatic; there are no manual stop or garbage-collection
+commands.
 
 The packaged Serena context disables project switching and memories. Agent
 tool allowlists remain the responsibility of each MCP client.
@@ -84,6 +85,7 @@ Install dependencies and run the normal test suite:
 
 ```sh
 uv sync --locked
+uv run pyright
 uv run pytest
 ```
 

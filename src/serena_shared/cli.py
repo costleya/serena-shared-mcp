@@ -10,10 +10,11 @@ from pathlib import Path
 
 from . import __version__
 from .lifecycle import (
-    collect_stale_servers,
-    ensure_shared_serena,
+    backend_identity,
+    create_proxy_lease,
+    ensure_backend,
+    run_watchdog,
     status,
-    stop_current_checkout,
 )
 from .transport import bridge_stdio, probe_mcp
 
@@ -28,31 +29,57 @@ def parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="proxy",
-        choices=("proxy", "status", "stop", "gc"),
+        choices=("proxy", "status"),
+    )
+    value.add_argument(
+        "--idle-timeout-minutes",
+        type=positive_integer,
+        default=15,
+        metavar="MINUTES",
+        help="stop the Serena backend after this many idle minutes (default: 15)",
     )
     return value
 
 
+def positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def run(argv: Sequence[str] | None = None, cwd: Path | str | None = None) -> int:
-    command = parser().parse_args(argv).command
+    arguments = parser().parse_args(argv)
+    command = arguments.command
     if command == "proxy":
-        record = ensure_shared_serena(probe_mcp, cwd)
-        bridge_stdio(record["endpoint"])
+        lease = create_proxy_lease(arguments.idle_timeout_minutes, cwd)
+        try:
+            def endpoint() -> tuple[str, int]:
+                record = ensure_backend(lease.checkout, lease.paths, probe_mcp)
+                return str(record["endpoint"]), int(record["pid"])
+
+            def identity() -> tuple[str, int] | None:
+                return backend_identity(lease.paths, lease.checkout.root)
+
+            bridge_stdio(endpoint, identity, lease)
+        finally:
+            lease.close()
         return 0
     if command == "status":
         _, output = status(probe_mcp, cwd)
         print(json.dumps(output, indent=2))
         return 0
-    if command == "stop":
-        _, message = stop_current_checkout(cwd)
-        print(message)
-        return 0
-    print(json.dumps(collect_stale_servers(cwd), indent=2))
     return 0
 
 
 def main() -> None:
     try:
+        if len(sys.argv) == 4 and sys.argv[1] == "__watchdog":
+            run_watchdog(sys.argv[2], sys.argv[3])
+            raise SystemExit(0)
         raise SystemExit(run())
     except (OSError, RuntimeError, TimeoutError, ValueError) as error:
         print(str(error), file=sys.stderr)
