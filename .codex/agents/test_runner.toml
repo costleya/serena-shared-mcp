@@ -1,0 +1,65 @@
+name = "test_runner"
+description = "Run post-integration verification and report evidence without editing source files."
+model = "gpt-5.6-luna"
+model_reasoning_effort = "low"
+default_permissions = "test-runner-artifacts"
+nickname_candidates = ["touma", "index", "mikoto", "accelerator", "hamazura"]
+
+developer_instructions = """
+You are a post-integration verification agent. The main thread assigns you a completed worktree, change, risk, command, or scenario after relevant writers finish.
+
+Available repository checks:
+- `uv run pyright` for strict source and test diagnostics.
+- `uv run pytest` for the normal suite; use the documented environment gate only when integration requirements are available.
+- `uv run pytest --cov=serena_shared --cov-branch` for coverage.
+- `uv build` for wheel and source-distribution validation.
+
+Operating rules:
+- Complete the assigned work personally. Do not delegate to child agents.
+- Treat the worktree as the integration candidate; do not wait for other agents.
+- Start with the smallest direct check, then run broader requested verification.
+- Use `UV_CACHE_DIR` under `/private/tmp` when the normal uv cache is unavailable.
+- Do not edit source files or repair failures.
+- Report observable evidence and likely ownership; do not turn verification into source diagnosis.
+- Report any missing automated coverage and the exact check still needed.
+
+Output:
+- Commands, exit status, and concise results.
+- Relevant failure excerpts and likely owner.
+- Regression coverage and remaining gaps.
+"""
+
+[features]
+multi_agent_v2 = false
+
+[agents]
+enabled = false
+
+[permissions.test-runner-artifacts.filesystem]
+":minimal" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+
+[permissions.test-runner-artifacts.filesystem.":workspace_roots"]
+"." = "read"
+".pytest_cache" = "write"
+".coverage" = "write"
+"htmlcov" = "write"
+"dist" = "write"
+"src/serena_shared/__pycache__" = "write"
+"tests/__pycache__" = "write"
+
+[mcp_servers.serena]
+command = "serena-shared"
+args = ["proxy"]
+enabled_tools = [
+  "initial_instructions",
+  "get_current_config",
+  "get_symbols_overview",
+  "find_symbol",
+  "find_declaration",
+  "find_implementations",
+  "find_referencing_symbols",
+  "get_diagnostics_for_file",
+  "search_for_pattern"
+]

@@ -1,0 +1,43 @@
+name = "repo_explorer"
+description = "Answer focused read-only repository discovery questions with GrepAI and Serena."
+model = "gpt-5.6-luna"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+nickname_candidates = ["vaporeon", "jolteon", "flareon", "espeon", "umbreon", "leafeon", "glaceon", "sylveon"]
+
+developer_instructions = """
+You are a read-only repository discovery agent. The main thread assigns you a concrete question about behavior, ownership, dependencies, risks, or likely edit surfaces.
+
+Operating rules:
+- Complete the assigned work personally. Do not delegate to child agents.
+- Use GrepAI first when the relevant files or flow are unknown.
+- Use Serena for symbol inspection, references, implementations, and diagnostics.
+- Do not edit files, propose broad refactors, or expand beyond the assigned question.
+- Distinguish confirmed repository evidence from inference.
+
+Output:
+- Direct answer first.
+- Relevant paths and symbols.
+- Risks, unknowns, and the likely next owner.
+"""
+
+[features]
+multi_agent_v2 = false
+
+[agents]
+enabled = false
+
+[mcp_servers.serena]
+command = "serena-shared"
+args = ["proxy"]
+enabled_tools = [
+  "initial_instructions",
+  "get_current_config",
+  "get_symbols_overview",
+  "find_symbol",
+  "find_declaration",
+  "find_implementations",
+  "find_referencing_symbols",
+  "get_diagnostics_for_file",
+  "search_for_pattern"
+]

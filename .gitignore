@@ -6,3 +6,7 @@ __pycache__/
 htmlcov/
 dist/
 *.egg-info/
+.grepai/
+
+# Lockfile-managed skills
+.agents/skills/*
