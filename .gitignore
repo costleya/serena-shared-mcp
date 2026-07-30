@@ -10,3 +10,5 @@ dist/
 
 # Lockfile-managed skills
 .agents/skills/*
+
+.serena
