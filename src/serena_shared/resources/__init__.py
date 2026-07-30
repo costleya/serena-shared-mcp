@@ -1,0 +1,1 @@
+"""Packaged Serena context resources."""
