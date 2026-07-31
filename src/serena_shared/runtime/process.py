@@ -13,16 +13,19 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from importlib.resources import files
 from pathlib import Path
-from typing import Any, Callable, Generator, Mapping, TypeGuard
+from typing import Any, Callable, Generator, Mapping, Sequence, TypeGuard
+
+from serena_shared._typing import is_json_object
 
 from .models import (
     Checkout,
     ProcessFingerprint,
+    RuntimeProfile,
     SerenaRecord,
     StatePaths,
     WatchdogRecord,
+    is_serena_record,
 )
 
 PORT_START = 9121
@@ -35,10 +38,6 @@ POLL_INTERVAL_SECONDS = 0.2
 
 def endpoint_for_port(port: int) -> str:
     return f"http://127.0.0.1:{port}/mcp"
-
-
-def default_context_path() -> Path:
-    return Path(str(files("serena_shared.resources").joinpath("serena.yml")))
 
 
 def read_json(path: Path) -> dict[str, Any] | None:
@@ -123,10 +122,6 @@ def is_process_alive(pid: int) -> bool:
         return False
 
 
-def is_json_object(value: Any) -> TypeGuard[dict[str, Any]]:
-    return isinstance(value, dict)
-
-
 def is_same_process_fingerprint(actual: Any, expected: Any) -> bool:
     return bool(
         is_json_object(actual)
@@ -137,14 +132,22 @@ def is_same_process_fingerprint(actual: Any, expected: Any) -> bool:
     )
 
 
-def is_registry_record_for_checkout(record: Any, checkout: Path | str) -> TypeGuard[SerenaRecord]:
-    return bool(
-        is_json_object(record)
-        and record.get("root") == os.fspath(checkout)
-        and isinstance(record.get("pid"), int)
-        and isinstance(record.get("port"), int)
-        and PORT_START <= record["port"] <= PORT_END
-        and record.get("endpoint") == endpoint_for_port(record["port"])
+def is_registry_record_for_profile_digest(
+    record: object,
+    checkout: Path | str,
+    profile_digest: str | None = None,
+) -> TypeGuard[SerenaRecord]:
+    if not is_serena_record(record):
+        return False
+    port = record["port"]
+    return (
+        record["root"] == os.fspath(checkout)
+        and PORT_START <= port <= PORT_END
+        and record["endpoint"] == endpoint_for_port(port)
+        and (
+            profile_digest is None
+            or record["profile"]["digest"] == profile_digest
+        )
     )
 
 
@@ -153,9 +156,11 @@ def is_serena_fingerprint(fingerprint: Any, record: Any) -> bool:
         fingerprint, record.get("process")
     ):
         return False
-    if not is_json_object(fingerprint) or not isinstance(fingerprint.get("command"), str):
+    if not is_json_object(fingerprint):
         return False
-    command = fingerprint["command"]
+    command = fingerprint.get("command")
+    if not isinstance(command, str):
+        return False
     return (
         "serena start-mcp-server" in command
         and f"--port {record.get('port')}" in command
@@ -187,15 +192,30 @@ def find_available_port(excluded: set[int] | None = None) -> int:
     raise RuntimeError(f"No shared Serena port is available in {PORT_START}-{PORT_END}.")
 
 
-def create_serena_record(checkout: Path, endpoint: str, log: Path, pid: int, port: int, process: ProcessFingerprint | None, state: str) -> SerenaRecord:
-    return {
+def create_serena_record(
+    checkout: Path,
+    endpoint: str,
+    log: Path,
+    pid: int,
+    port: int,
+    process: ProcessFingerprint | None,
+    state: str,
+    profile: RuntimeProfile,
+) -> SerenaRecord:
+    value: SerenaRecord = {
         "root": os.fspath(checkout), "pid": pid, "port": port, "endpoint": endpoint,
         "log": os.fspath(log), "process": process, "fingerprintAvailable": process is not None,
-        "state": state,
+        "state": state, "profile": profile.as_record(),
     }
+    return value
 
 
-def start_serena(checkout: Path, port: int, context: Path, log: Path) -> int:
+def start_serena(
+    checkout: Path,
+    port: int,
+    log: Path,
+    serena_args: Sequence[str],
+) -> int:
     executable = shutil.which("serena")
     if executable is None:
         raise RuntimeError("Serena is not installed or is not available on PATH.")
@@ -203,12 +223,24 @@ def start_serena(checkout: Path, port: int, context: Path, log: Path) -> int:
     stream = log.open("a")
     try:
         child = subprocess.Popen(
-            [executable, "start-mcp-server", "--transport", "streamable-http", "--host", "127.0.0.1",
-             "--port", str(port), "--project", os.fspath(checkout), "--context", os.fspath(context),
-             "--mode", "one-shot", "--mode", "no-memories", "--enable-web-dashboard", "true",
-             "--open-web-dashboard", "false"],
-            stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
-            start_new_session=True, close_fds=True,
+            [
+                executable,
+                "start-mcp-server",
+                "--transport",
+                "streamable-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--project",
+                os.fspath(checkout),
+                *serena_args,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
         )
         return child.pid
     finally:
@@ -232,35 +264,41 @@ def terminate_verified_serena(record: SerenaRecord) -> bool:
     return False
 
 
-def start_shared_serena(checkout: Path, common_git_dir: Path, probe: Callable[[str], bool], context: Path | None = None) -> SerenaRecord:
+def is_registry_record_for_profile(record: Any, checkout: Path | str, profile: RuntimeProfile) -> TypeGuard[SerenaRecord]:
+    return is_registry_record_for_profile_digest(record, checkout, profile.digest)
+
+
+def start_shared_serena(
+    checkout: Path,
+    common_git_dir: Path,
+    probe: Callable[[str], bool],
+    profile: RuntimeProfile,
+    serena_args: Sequence[str],
+) -> SerenaRecord:
     from .lifecycle import paths_for_checkout
 
-    paths = paths_for_checkout(common_git_dir, checkout)
-    context = default_context_path() if context is None else context
+    paths = paths_for_checkout(common_git_dir, checkout, profile=profile)
     with file_lock(paths.startup_lock):
         existing = read_json(paths.record)
         if existing:
-            if not is_registry_record_for_checkout(existing, checkout):
-                existing_pid = existing.get("pid")
-                if isinstance(existing_pid, int) and is_process_alive(existing_pid):
-                    raise RuntimeError(f"Refusing to replace a live mismatched shared Serena record for {checkout}.")
+            if not is_registry_record_for_profile(existing, checkout, profile):
                 paths.record.unlink(missing_ok=True)
             elif is_process_alive(existing["pid"]):
-                if existing.get("state") == "pending":
+                if not is_owned_serena(existing):
+                    paths.record.unlink(missing_ok=True)
+                elif existing.get("state") == "pending":
                     actual = process_fingerprint(existing["pid"])
-                    candidate: SerenaRecord = existing if existing.get("process") else {**existing, "process": actual}
-                    if ((actual and is_serena_fingerprint(actual, candidate)) or actual is None) and probe(existing["endpoint"]):
-                        active: SerenaRecord = {**existing, "process": actual or existing.get("process"), "state": "active"}
+                    if actual and is_serena_fingerprint(actual, existing) and probe(existing["endpoint"]):
+                        active: SerenaRecord = {**existing, "process": actual, "state": "active"}
                         write_json_atomically(paths.record, active)
                         return active
                     raise RuntimeError(f"Shared Serena startup remains pending verification for {checkout}.")
-                if not has_matching_record_fingerprint(existing):
-                    raise RuntimeError(f"Refusing to replace an unverified live shared Serena process for {checkout}.")
-                if probe(existing["endpoint"]):
+                elif probe(existing["endpoint"]):
                     return existing
-                if not terminate_verified_serena(existing):
-                    raise RuntimeError(f"Refusing to replace an unverified live shared Serena process for {checkout}.")
-                paths.record.unlink(missing_ok=True)
+                else:
+                    if not terminate_verified_serena(existing):
+                        raise RuntimeError(f"Refusing to replace an unverified live shared Serena process for {checkout}.")
+                    paths.record.unlink(missing_ok=True)
             else:
                 paths.record.unlink(missing_ok=True)
 
@@ -273,10 +311,10 @@ def start_shared_serena(checkout: Path, common_git_dir: Path, probe: Callable[[s
                 pid: int | None = None
                 fingerprint: ProcessFingerprint | None = None
                 try:
-                    pid = start_serena(checkout, port, context, paths.log)
+                    pid = start_serena(checkout, port, paths.log, serena_args)
                     initial = process_fingerprint(pid)
                     if initial:
-                        initial_record = create_serena_record(checkout, endpoint, paths.log, pid, port, initial, "pending")
+                        initial_record = create_serena_record(checkout, endpoint, paths.log, pid, port, initial, "pending", profile)
                         if is_serena_fingerprint(initial, initial_record):
                             fingerprint = initial
                     deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
@@ -285,7 +323,7 @@ def start_shared_serena(checkout: Path, common_git_dir: Path, probe: Callable[[s
                             break
                         current = process_fingerprint(pid)
                         if current:
-                            candidate = create_serena_record(checkout, endpoint, paths.log, pid, port, current, "pending")
+                            candidate = create_serena_record(checkout, endpoint, paths.log, pid, port, current, "pending", profile)
                             if is_serena_fingerprint(current, candidate):
                                 fingerprint = current
                             elif fingerprint:
@@ -293,7 +331,7 @@ def start_shared_serena(checkout: Path, common_git_dir: Path, probe: Callable[[s
                         if probe(endpoint):
                             if not fingerprint:
                                 raise RuntimeError("Shared Serena process fingerprint could not be verified.")
-                            record = create_serena_record(checkout, endpoint, paths.log, pid, port, fingerprint, "active")
+                            record = create_serena_record(checkout, endpoint, paths.log, pid, port, fingerprint, "active", profile)
                             write_json_atomically(paths.record, record)
                             return record
                         time.sleep(POLL_INTERVAL_SECONDS)
@@ -303,7 +341,7 @@ def start_shared_serena(checkout: Path, common_git_dir: Path, probe: Callable[[s
                 except Exception as error:
                     if pid is None:
                         raise
-                    record = create_serena_record(checkout, endpoint, paths.log, pid, port, fingerprint, "pending")
+                    record = create_serena_record(checkout, endpoint, paths.log, pid, port, fingerprint, "pending", profile)
                     if fingerprint and terminate_verified_serena(record):
                         raise RuntimeError(f"Shared Serena startup was contained after failure for {checkout}.") from error
                     if is_process_alive(pid):
@@ -315,7 +353,7 @@ def start_shared_serena(checkout: Path, common_git_dir: Path, probe: Callable[[s
 
 def start_watchdog(checkout: Checkout, paths: StatePaths) -> WatchdogRecord:
     child = subprocess.Popen(
-        [sys.executable, "-m", "serena_shared.cli", "__watchdog", os.fspath(checkout.root), os.fspath(checkout.common_git_dir)],
+        [sys.executable, "-m", "serena_shared.cli", "__watchdog", os.fspath(checkout.root), os.fspath(checkout.common_git_dir), paths.key],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, close_fds=True,
     )
@@ -326,7 +364,10 @@ def start_watchdog(checkout: Checkout, paths: StatePaths) -> WatchdogRecord:
 
 
 def is_live_watchdog(value: Any) -> bool:
-    if not is_json_object(value) or not isinstance(value.get("pid"), int):
+    if not is_json_object(value):
         return False
-    actual = process_fingerprint(value["pid"])
+    pid = value.get("pid")
+    if not isinstance(pid, int):
+        return False
+    actual = process_fingerprint(pid)
     return actual is not None and is_same_process_fingerprint(actual, value.get("process"))

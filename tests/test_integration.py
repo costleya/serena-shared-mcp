@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import pytest
@@ -106,8 +106,13 @@ def exercise_bridge(tmp_path: Path, fake_source: str, python: str) -> None:
                 assert first.structured_content == {"result": "first"}
                 assert second.structured_content == {"result": "second"}
                 assert status_one["healthy"] and status_two["healthy"]
-                first_record = status_one["record"]
-                second_record = status_two["record"]
+                first_profiles = status_one["profiles"]
+                second_profiles = status_two["profiles"]
+                assert isinstance(first_profiles, list) and isinstance(second_profiles, list)
+                first_entry = cast(dict[str, Any], first_profiles[0])
+                second_entry = cast(dict[str, Any], second_profiles[0])
+                first_record = first_entry["record"]
+                second_record = second_entry["record"]
                 assert isinstance(first_record, dict) and isinstance(second_record, dict)
                 assert first_record["pid"] == second_record["pid"]
 
@@ -117,10 +122,10 @@ def exercise_bridge(tmp_path: Path, fake_source: str, python: str) -> None:
     final_status: dict[str, Any] = {}
     while time.monotonic() < deadline:
         final_status = read_status()
-        if final_status["record"] is None:
+        if not final_status["profiles"]:
             break
         time.sleep(0.2)
-    assert final_status["record"] is None
+    assert final_status["profiles"] == []
 
 
 def test_two_stdio_clients_reuse_one_modern_http_backend(tmp_path: Path) -> None:
@@ -154,8 +159,9 @@ def test_open_stdio_client_restarts_idle_backend_transparently(tmp_path: Path) -
         async with Client(stdio_client(params), read_timeout_seconds=15) as client:
             first = await client.call_tool("echo", {"value": "before"})
             resolved = lifecycle.resolve_checkout(checkout)
+            profile = lifecycle.profile_from_key()
             paths = lifecycle.paths_for_checkout(
-                resolved.common_git_dir, resolved.root
+                resolved.common_git_dir, resolved.root, profile=profile
             )
             original = process.read_json(paths.record)
             assert original is not None

@@ -53,6 +53,31 @@ connected, while the heavier Serena and language-server processes stop after
 the configured period without completed requests. A later request starts and
 reinitializes Serena transparently.
 
+## CLI and Serena pass-through
+
+The wrapper owns only the `proxy` and `status` commands, `--profile-key`, and
+`--idle-timeout-minutes`. It does not inject a Serena context, mode, dashboard,
+browser, onboarding, or memories setting: Serena's native defaults apply.
+
+Pass Serena arguments after an explicit `--` separator:
+
+```sh
+serena-shared proxy
+serena-shared proxy -- --context desktop-app
+serena-shared proxy --profile-key readonly -- --context ./readonly.yml
+```
+
+The wrapper rejects these Serena tail flags because it owns the checkout and
+loopback transport: `--project`, `--project-file`, `--project-from-cwd`,
+`--transport`, `--host`, and `--port`. Their `--flag=value` forms are rejected
+as well.
+
+A backend identity is only the Git checkout and a nullable profile key. Within
+one checkout and key, the first live backend's forwarded Serena arguments win.
+When that backend is restarted, the invocation that triggers the restart
+supplies its current forwarded arguments. Different profile keys run
+independently. The idle timeout defaults to 15 minutes.
+
 ## MCP version compatibility
 
 `serena-shared-mcp` itself uses the stable MCP Python SDK v2. It supports both
@@ -71,13 +96,12 @@ that use MCP SDK v2.
 serena-shared status
 ```
 
-`status` reports the current checkout's registry record, health, live proxy and
-in-flight request counts, next idle shutdown, and watchdog health. Process and
-state cleanup is automatic; there are no manual stop or garbage-collection
-commands.
+`status` lists the registered profile keys for the current checkout, including
+records that are not healthy. Records belonging to other checkouts are ignored.
 
-The packaged Serena context disables project switching and memories. Agent
-tool allowlists remain the responsibility of each MCP client.
+Process and state cleanup is automatic; there are no manual stop or
+garbage-collection commands. Agent tool allowlists remain the responsibility
+of each MCP client.
 
 ## Development
 

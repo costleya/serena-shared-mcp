@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence, TypeGuard
 
-from .models import Checkout, IdleState, LeaseRecord, StatePaths
+from serena_shared._typing import is_json_object
+
+from .models import Checkout, IdleState, LeaseRecord, RuntimeProfile, StatePaths
 from .process import (
     file_lock,
-    is_json_object,
     is_same_process_fingerprint,
     process_fingerprint,
     read_json,
@@ -29,13 +30,17 @@ class ProxyLease:
     checkout: Checkout
     paths: StatePaths
     path: Path
+    profile: RuntimeProfile
+    serena_args: tuple[str, ...]
 
     def _update(self, *, started: bool = False, finished: bool = False) -> None:
         with file_lock(self.paths.startup_lock):
             record = read_json(self.path)
             if not is_json_object(record):
                 raise RuntimeError("Shared Serena proxy lease disappeared.")
-            in_flight = int(record.get("inFlight", 0))
+            in_flight = record.get("inFlight", 0)
+            if not isinstance(in_flight, int):
+                raise RuntimeError("Shared Serena proxy lease is invalid.")
             if started:
                 in_flight += 1
             if finished:
@@ -53,13 +58,19 @@ class ProxyLease:
             self.path.unlink(missing_ok=True)
 
 
-def create_proxy_lease(idle_timeout_minutes: int, cwd: Path | str | None = None) -> ProxyLease:
+def create_proxy_lease(
+    idle_timeout_minutes: int,
+    profile: RuntimeProfile,
+    serena_args: Sequence[str],
+    *,
+    cwd: Path | str | None = None,
+) -> ProxyLease:
     if idle_timeout_minutes <= 0:
         raise ValueError("Idle timeout minutes must be a positive integer.")
     from .lifecycle import paths_for_checkout, resolve_checkout
 
     checkout = resolve_checkout(cwd)
-    paths = paths_for_checkout(checkout.common_git_dir, checkout.root)
+    paths = paths_for_checkout(checkout.common_git_dir, checkout.root, profile=profile)
     fingerprint = process_fingerprint(os.getpid())
     if fingerprint is None:
         raise RuntimeError("Shared Serena proxy fingerprint could not be verified.")
@@ -69,22 +80,27 @@ def create_proxy_lease(idle_timeout_minutes: int, cwd: Path | str | None = None)
             "root": os.fspath(checkout.root), "pid": os.getpid(), "process": fingerprint,
             "idleTimeoutMinutes": idle_timeout_minutes, "lastActivityAt": time.time(), "inFlight": 0,
         })
-    return ProxyLease(checkout, paths, path)
+    return ProxyLease(checkout, paths, path, profile, tuple(serena_args))
 
 
 def is_live_lease(record: Any, checkout: Path | str) -> TypeGuard[LeaseRecord]:
-    if not (
-        is_json_object(record)
-        and record.get("root") == os.fspath(checkout)
-        and isinstance(record.get("pid"), int)
-        and isinstance(record.get("idleTimeoutMinutes"), int)
-        and record["idleTimeoutMinutes"] > 0
-        and isinstance(record.get("lastActivityAt"), (int, float))
-        and isinstance(record.get("inFlight"), int)
-        and record["inFlight"] >= 0
+    if not is_json_object(record):
+        return False
+    pid = record.get("pid")
+    idle_timeout = record.get("idleTimeoutMinutes")
+    last_activity = record.get("lastActivityAt")
+    in_flight = record.get("inFlight")
+    if (
+        record.get("root") != os.fspath(checkout)
+        or not isinstance(pid, int)
+        or not isinstance(idle_timeout, int)
+        or idle_timeout <= 0
+        or not isinstance(last_activity, (int, float))
+        or not isinstance(in_flight, int)
+        or in_flight < 0
     ):
         return False
-    actual = process_fingerprint(record["pid"])
+    actual = process_fingerprint(pid)
     return actual is not None and is_same_process_fingerprint(actual, record.get("process"))
 
 

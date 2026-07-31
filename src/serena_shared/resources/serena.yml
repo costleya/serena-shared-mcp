@@ -1,7 +1,0 @@
-description: Shared Serena MCP server for a fixed Git checkout
-prompt: |
-  Use Serena for symbol navigation, references, diagnostics, and scoped edits.
-  This server is fixed to the checkout selected at startup. Do not attempt to switch projects.
-
-excluded_tools:
-  - activate_project

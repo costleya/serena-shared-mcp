@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol, cast
+
+from serena_shared._typing import is_json_object
 
 import anyio
 from mcp import Client
@@ -35,14 +37,14 @@ def probe_mcp(endpoint: str, timeout: float = 3.0) -> bool:
     return anyio.run(probe_mcp_async, endpoint, timeout)
 
 
-def _message_params(message: Any) -> dict[str, Any] | None:
+def _message_params(message: Any) -> Mapping[str, object] | None:
     data: dict[str, Any] = message.model_dump(
         by_alias=True, mode="json", exclude_unset=True
     )
     params = data.get("params")
-    if not isinstance(params, dict):
+    if not is_json_object(params):
         return None
-    return cast(dict[str, Any], params)
+    return params
 
 
 def _client_message_headers(
@@ -58,9 +60,8 @@ def _client_message_headers(
         return None
 
     meta = params.get("_meta")
-    if not isinstance(meta, dict):
+    if not is_json_object(meta):
         return None
-    meta = cast(dict[str, Any], meta)
 
     protocol_version = meta.get(PROTOCOL_VERSION_META_KEY, None)
     if not isinstance(protocol_version, str):

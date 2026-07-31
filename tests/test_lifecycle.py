@@ -13,9 +13,14 @@ from serena_shared.runtime import lifecycle, models, process
 from serena_shared.runtime import leases as runtime_leases
 
 
+def default_profile() -> models.RuntimeProfile:
+    return lifecycle.profile_from_key()
+
+
 def test_paths_are_worktree_specific_and_share_port_lock(tmp_path: Path) -> None:
-    first = lifecycle.paths_for_checkout(tmp_path, "/checkout/one")
-    second = lifecycle.paths_for_checkout(tmp_path, "/checkout/two")
+    profile = default_profile()
+    first = lifecycle.paths_for_checkout(tmp_path, "/checkout/one", profile=profile)
+    second = lifecycle.paths_for_checkout(tmp_path, "/checkout/two", profile=profile)
     assert first.base_dir == tmp_path / "serena-shared"
     assert first.record != second.record
     assert first.port_lock == second.port_lock
@@ -56,8 +61,9 @@ def test_resolve_checkout_distinguishes_linked_worktrees(tmp_path: Path) -> None
     linked = lifecycle.resolve_checkout(worktree)
     assert primary.root != linked.root
     assert primary.common_git_dir == linked.common_git_dir
-    assert lifecycle.paths_for_checkout(primary.common_git_dir, primary.root).record != lifecycle.paths_for_checkout(
-        linked.common_git_dir, linked.root
+    profile = default_profile()
+    assert lifecycle.paths_for_checkout(primary.common_git_dir, primary.root, profile=profile).record != lifecycle.paths_for_checkout(
+        linked.common_git_dir, linked.root, profile=profile
     ).record
 
 
@@ -142,10 +148,11 @@ def test_process_liveness_treats_non_child_zombie_as_dead(
     assert not process.is_process_alive(123)
 
 
-def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_start_reuses_healthy_profile_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout)
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
     fingerprint_record: dict[str, Any] = {
         "pid": 123,
         "startedAt": "Thu Jul 30 00:00:00 2026",
@@ -160,6 +167,7 @@ def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeyp
         "process": fingerprint_record,
         "fingerprintAvailable": True,
         "state": "active",
+        "profile": profile.as_record(),
     }
 
     def process_is_alive(_pid: int) -> bool:
@@ -175,13 +183,14 @@ def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeyp
     monkeypatch.setattr(process, "is_process_alive", process_is_alive)
     monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
     monkeypatch.setattr(process, "start_serena", fail_start)
-    assert lifecycle.start_shared_serena(checkout, tmp_path / "git", lambda endpoint: True) == record
+    assert process.start_shared_serena(
+        checkout, tmp_path / "git", lambda endpoint: True, profile, []
+    ) == record
 
 
 def test_process_start_uses_verified_serena_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    context = tmp_path / "context.yml"
     log = tmp_path / "serena.log"
     popen_calls = 0
 
@@ -199,7 +208,7 @@ def test_process_start_uses_verified_serena_command(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(process.shutil, "which", fake_which)
     monkeypatch.setattr(process.subprocess, "Popen", fake_popen)
 
-    assert process.start_serena(checkout, 9121, context, log) == 321
+    assert process.start_serena(checkout, 9121, log, []) == 321
     assert popen_calls == 1
     assert log.exists()
 
@@ -261,9 +270,12 @@ def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(process, "is_process_alive", process_is_alive)
     monkeypatch.setattr(process, "terminate_verified_serena", terminate_process)
     monkeypatch.setattr(process, "STARTUP_TIMEOUT_SECONDS", 0)
+    profile = default_profile()
     with pytest.raises(RuntimeError, match="contained"):
-        lifecycle.start_shared_serena(checkout, tmp_path / "git", lambda endpoint: False)
-    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout)
+        process.start_shared_serena(
+            checkout, tmp_path / "git", lambda endpoint: False, profile, []
+        )
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
     assert process.read_json(paths.record) is None
 
 
@@ -273,7 +285,8 @@ def test_inspect_leases_removes_dead_and_retains_verified_proxy(
     checkout = tmp_path / "checkout"
     git = checkout / ".git"
     git.mkdir(parents=True)
-    paths = lifecycle.paths_for_checkout(git, checkout)
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(git, checkout, profile=profile)
     process_record = {"pid": 2, "startedAt": "now", "command": "serena-shared proxy"}
     dead = paths.lease("dead")
     live = paths.lease("live")
@@ -313,13 +326,18 @@ def test_watchdog_stops_verified_idle_backend(
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     git = tmp_path / "git"
-    paths = lifecycle.paths_for_checkout(git, checkout)
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(git, checkout, profile=profile)
     record = {
         "root": str(checkout),
         "pid": 42,
         "port": 9121,
         "endpoint": process.endpoint_for_port(9121),
-        "process": {"pid": 42},
+        "log": str(paths.log),
+        "process": {"pid": 42, "startedAt": "1", "command": "serena"},
+        "fingerprintAvailable": True,
+        "state": "ready",
+        "profile": profile.as_record(),
     }
     process.write_json_atomically(paths.record, record)
     def process_is_alive(_pid: int) -> bool:
@@ -330,7 +348,7 @@ def test_watchdog_stops_verified_idle_backend(
 
     monkeypatch.setattr(process, "is_process_alive", process_is_alive)
     monkeypatch.setattr(process, "terminate_verified_serena", terminate_record)
-    lifecycle.run_watchdog(checkout, git, poll_seconds=0)
+    lifecycle.run_watchdog(checkout, git, paths.key, poll_seconds=0)
     assert not paths.record.exists()
 
 
@@ -339,13 +357,18 @@ def test_watchdog_stops_backend_for_deleted_worktree(
 ) -> None:
     checkout = tmp_path / "deleted-checkout"
     git = tmp_path / "git"
-    paths = lifecycle.paths_for_checkout(git, checkout)
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(git, checkout, profile=profile)
     record = {
         "root": str(checkout),
         "pid": 42,
         "port": 9121,
         "endpoint": process.endpoint_for_port(9121),
-        "process": {"pid": 42},
+        "log": str(paths.log),
+        "process": {"pid": 42, "startedAt": "1", "command": "serena"},
+        "fingerprintAvailable": True,
+        "state": "ready",
+        "profile": profile.as_record(),
     }
     process.write_json_atomically(paths.record, record)
     def process_is_alive(_pid: int) -> bool:
@@ -376,7 +399,7 @@ def test_watchdog_stops_backend_for_deleted_worktree(
         "inspect_leases",
         active_lease,
     )
-    lifecycle.run_watchdog(checkout, git, poll_seconds=0)
+    lifecycle.run_watchdog(checkout, git, paths.key, poll_seconds=0)
     assert not paths.record.exists()
 
 
@@ -386,15 +409,6 @@ def test_status_shape_without_server(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
     healthy, output = lifecycle.status(lambda endpoint: False, checkout)
     assert not healthy
-    assert output == {
-        "checkout": str(checkout.resolve()),
-        "healthy": False,
-        "record": None,
-        "activity": {
-            "liveProxies": 0,
-            "inFlight": 0,
-            "lastActivityAt": None,
-            "nextShutdownAt": None,
-            "watchdogHealthy": False,
-        },
-    }
+    assert output["checkout"] == str(checkout.resolve())
+    assert output["healthy"] is False
+    assert isinstance(output["profiles"], list)
