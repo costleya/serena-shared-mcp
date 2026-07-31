@@ -5,11 +5,12 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import pytest
 
-from serena_shared import lifecycle
+from serena_shared.runtime import lifecycle, models, process
+from serena_shared.runtime import leases as runtime_leases
 
 
 def test_paths_are_worktree_specific_and_share_port_lock(tmp_path: Path) -> None:
@@ -18,8 +19,25 @@ def test_paths_are_worktree_specific_and_share_port_lock(tmp_path: Path) -> None
     assert first.base_dir == tmp_path / "serena-shared"
     assert first.record != second.record
     assert first.port_lock == second.port_lock
-    assert lifecycle.endpoint_for_port(9121) == "http://127.0.0.1:9121/mcp"
+    assert process.endpoint_for_port(9121) == "http://127.0.0.1:9121/mcp"
     assert first.lease("client").name.endswith(".client.lease.json")
+
+
+def test_lifecycle_no_longer_reexports_runtime_helpers() -> None:
+    removed_names = {
+        "endpoint_for_port",
+        "file_lock",
+        "IdleState",
+        "is_process_alive",
+        "lease_paths",
+        "read_json",
+        "StatePaths",
+        "write_json_atomically",
+    }
+    assert all(not hasattr(lifecycle, name) for name in removed_names)
+    assert all(name not in lifecycle.__all__ for name in removed_names)
+    assert hasattr(lifecycle, "paths_for_checkout")
+    assert "paths_for_checkout" in lifecycle.__all__
 
 
 def test_resolve_checkout_distinguishes_linked_worktrees(tmp_path: Path) -> None:
@@ -45,9 +63,9 @@ def test_resolve_checkout_distinguishes_linked_worktrees(tmp_path: Path) -> None
 
 def test_atomic_json_replaces_complete_document(tmp_path: Path) -> None:
     target = tmp_path / "state" / "record.json"
-    lifecycle.write_json_atomically(target, {"value": 1})
-    lifecycle.write_json_atomically(target, {"value": 2, "complete": True})
-    assert lifecycle.read_json(target) == {"value": 2, "complete": True}
+    process.write_json_atomically(target, {"value": 1})
+    process.write_json_atomically(target, {"value": 2, "complete": True})
+    assert process.read_json(target) == {"value": 2, "complete": True}
     assert list(target.parent.glob(f".{target.name}.*")) == []
 
 
@@ -58,7 +76,7 @@ def test_flock_serializes_callers(tmp_path: Path) -> None:
 
     def worker() -> None:
         nonlocal active, maximum
-        with lifecycle.file_lock(lock):
+        with process.file_lock(lock):
             active += 1
             maximum = max(maximum, active)
             time.sleep(0.05)
@@ -79,11 +97,11 @@ def test_process_fingerprint_rejects_non_serena_process(monkeypatch: pytest.Monk
         )
 
     monkeypatch.setattr(
-        lifecycle.subprocess,
+        process.subprocess,
         "run",
         fake_run,
     )
-    fingerprint = lifecycle.process_fingerprint(123)
+    fingerprint = process.process_fingerprint(123)
     assert fingerprint is not None
     record: dict[str, Any] = {
         "pid": fingerprint["pid"],
@@ -91,7 +109,7 @@ def test_process_fingerprint_rejects_non_serena_process(monkeypatch: pytest.Monk
         "root": "/checkout",
         "process": fingerprint,
     }
-    assert not lifecycle.is_serena_fingerprint(fingerprint, record)
+    assert not process.is_serena_fingerprint(fingerprint, record)
 
 
 def test_process_liveness_reaps_owned_child(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,9 +119,9 @@ def test_process_liveness_reaps_owned_child(monkeypatch: pytest.MonkeyPatch) -> 
     def fake_kill(_pid: int, _signal: int) -> NoReturn:
         pytest.fail("already reaped")
 
-    monkeypatch.setattr(lifecycle.os, "waitpid", fake_waitpid)
-    monkeypatch.setattr(lifecycle.os, "kill", fake_kill)
-    assert not lifecycle.is_process_alive(123)
+    monkeypatch.setattr(process.os, "waitpid", fake_waitpid)
+    monkeypatch.setattr(process.os, "kill", fake_kill)
+    assert not process.is_process_alive(123)
 
 
 def test_process_liveness_treats_non_child_zombie_as_dead(
@@ -118,17 +136,17 @@ def test_process_liveness_treats_non_child_zombie_as_dead(
     def zombie_status(args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args, 0, "Z+\n", "")
 
-    monkeypatch.setattr(lifecycle.os, "waitpid", non_child_waitpid)
-    monkeypatch.setattr(lifecycle.os, "kill", permitted_kill)
-    monkeypatch.setattr(lifecycle.subprocess, "run", zombie_status)
-    assert not lifecycle.is_process_alive(123)
+    monkeypatch.setattr(process.os, "waitpid", non_child_waitpid)
+    monkeypatch.setattr(process.os, "kill", permitted_kill)
+    monkeypatch.setattr(process.subprocess, "run", zombie_status)
+    assert not process.is_process_alive(123)
 
 
 def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout)
-    process: dict[str, Any] = {
+    fingerprint_record: dict[str, Any] = {
         "pid": 123,
         "startedAt": "Thu Jul 30 00:00:00 2026",
         "command": f"serena start-mcp-server --port 9123 --project {checkout}",
@@ -137,9 +155,9 @@ def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeyp
         "root": str(checkout),
         "pid": 123,
         "port": 9123,
-        "endpoint": lifecycle.endpoint_for_port(9123),
+        "endpoint": process.endpoint_for_port(9123),
         "log": str(paths.log),
-        "process": process,
+        "process": fingerprint_record,
         "fingerprintAvailable": True,
         "state": "active",
     }
@@ -148,22 +166,75 @@ def test_start_reuses_healthy_backward_compatible_record(tmp_path: Path, monkeyp
         return True
 
     def process_fingerprint(_pid: int) -> dict[str, Any]:
-        return process
+        return fingerprint_record
 
     def fail_start(*_args: Any) -> NoReturn:
         pytest.fail("must reuse")
 
-    lifecycle.write_json_atomically(paths.record, record)
-    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
-    monkeypatch.setattr(lifecycle, "process_fingerprint", process_fingerprint)
-    monkeypatch.setattr(lifecycle, "start_serena", fail_start)
+    process.write_json_atomically(paths.record, record)
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+    monkeypatch.setattr(process, "start_serena", fail_start)
     assert lifecycle.start_shared_serena(checkout, tmp_path / "git", lambda endpoint: True) == record
+
+
+def test_process_start_uses_verified_serena_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    context = tmp_path / "context.yml"
+    log = tmp_path / "serena.log"
+    popen_calls = 0
+
+    class FakeProcess:
+        pid = 321
+
+    def fake_popen(*_args: Any, **_kwargs: Any) -> FakeProcess:
+        nonlocal popen_calls
+        popen_calls += 1
+        return FakeProcess()
+
+    def fake_which(_name: str) -> str:
+        return "/usr/bin/serena"
+
+    monkeypatch.setattr(process.shutil, "which", fake_which)
+    monkeypatch.setattr(process.subprocess, "Popen", fake_popen)
+
+    assert process.start_serena(checkout, 9121, context, log) == 321
+    assert popen_calls == 1
+    assert log.exists()
+
+
+def test_process_termination_kills_owned_process_without_lifecycle_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kill_calls = 0
+    record = cast(
+        process.SerenaRecord,
+        {"pid": 321, "process": {"pid": 321, "startedAt": "now", "command": "serena"}},
+    )
+
+    def fake_kill(_pid: int, _signal: int) -> None:
+        nonlocal kill_calls
+        kill_calls += 1
+
+    def process_is_owned(_record: process.SerenaRecord) -> bool:
+        return True
+
+    def process_is_alive(_pid: int) -> bool:
+        return False
+
+    monkeypatch.setattr(process, "is_owned_serena", process_is_owned)
+    monkeypatch.setattr(process.os, "kill", fake_kill)
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+
+    assert process.terminate_verified_serena(record) is True
+    assert kill_calls == 1
 
 
 def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    process: dict[str, Any] = {
+    fingerprint_record: dict[str, Any] = {
         "pid": 321,
         "startedAt": "Thu Jul 30 00:00:00 2026",
         "command": f"serena start-mcp-server --port 9121 --project {checkout}",
@@ -176,7 +247,7 @@ def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: p
         return 321
 
     def process_fingerprint(_pid: int) -> dict[str, Any]:
-        return process
+        return fingerprint_record
 
     def process_is_alive(_pid: int) -> bool:
         return True
@@ -184,16 +255,16 @@ def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: p
     def terminate_process(_record: dict[str, Any]) -> bool:
         return True
 
-    monkeypatch.setattr(lifecycle, "find_available_port", find_port)
-    monkeypatch.setattr(lifecycle, "start_serena", start_process)
-    monkeypatch.setattr(lifecycle, "process_fingerprint", process_fingerprint)
-    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
-    monkeypatch.setattr(lifecycle, "terminate_verified_serena", terminate_process)
-    monkeypatch.setattr(lifecycle, "STARTUP_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(process, "find_available_port", find_port)
+    monkeypatch.setattr(process, "start_serena", start_process)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "terminate_verified_serena", terminate_process)
+    monkeypatch.setattr(process, "STARTUP_TIMEOUT_SECONDS", 0)
     with pytest.raises(RuntimeError, match="contained"):
         lifecycle.start_shared_serena(checkout, tmp_path / "git", lambda endpoint: False)
     paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout)
-    assert lifecycle.read_json(paths.record) is None
+    assert process.read_json(paths.record) is None
 
 
 def test_inspect_leases_removes_dead_and_retains_verified_proxy(
@@ -203,7 +274,7 @@ def test_inspect_leases_removes_dead_and_retains_verified_proxy(
     git = checkout / ".git"
     git.mkdir(parents=True)
     paths = lifecycle.paths_for_checkout(git, checkout)
-    process = {"pid": 2, "startedAt": "now", "command": "serena-shared proxy"}
+    process_record = {"pid": 2, "startedAt": "now", "command": "serena-shared proxy"}
     dead = paths.lease("dead")
     live = paths.lease("live")
     base = {
@@ -212,21 +283,21 @@ def test_inspect_leases_removes_dead_and_retains_verified_proxy(
         "lastActivityAt": 100.0,
         "inFlight": 0,
     }
-    lifecycle.write_json_atomically(dead, {**base, "pid": 1, "process": None})
-    lifecycle.write_json_atomically(live, {**base, "pid": 2, "process": process})
+    process.write_json_atomically(dead, {**base, "pid": 1, "process": None})
+    process.write_json_atomically(live, {**base, "pid": 2, "process": process_record})
     def fingerprint_for_live_proxy(pid: int) -> dict[str, int | str] | None:
-        return process if pid == 2 else None
+        return process_record if pid == 2 else None
 
-    monkeypatch.setattr(lifecycle, "process_fingerprint", fingerprint_for_live_proxy)
-    leases, removed = lifecycle.inspect_leases(paths, checkout)
+    monkeypatch.setattr(runtime_leases, "process_fingerprint", fingerprint_for_live_proxy)
+    live_leases, removed = lifecycle.inspect_leases(paths, checkout)
     assert removed == 1
     assert not dead.exists()
     assert live.exists()
-    assert leases == [{**base, "pid": 2, "process": process}]
+    assert live_leases == [{**base, "pid": 2, "process": process_record}]
 
 
 def test_idle_shutdown_waits_for_every_timeout_and_in_flight_request() -> None:
-    leases: list[lifecycle.IdleState] = [
+    leases: list[models.IdleState] = [
         {"idleTimeoutMinutes": 15, "lastActivityAt": 0.0, "inFlight": 0},
         {"idleTimeoutMinutes": 30, "lastActivityAt": 0.0, "inFlight": 0},
     ]
@@ -247,18 +318,18 @@ def test_watchdog_stops_verified_idle_backend(
         "root": str(checkout),
         "pid": 42,
         "port": 9121,
-        "endpoint": lifecycle.endpoint_for_port(9121),
+        "endpoint": process.endpoint_for_port(9121),
         "process": {"pid": 42},
     }
-    lifecycle.write_json_atomically(paths.record, record)
+    process.write_json_atomically(paths.record, record)
     def process_is_alive(_pid: int) -> bool:
         return True
 
     def terminate_record(value: dict[str, Any]) -> bool:
         return value == record
 
-    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
-    monkeypatch.setattr(lifecycle, "terminate_verified_serena", terminate_record)
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "terminate_verified_serena", terminate_record)
     lifecycle.run_watchdog(checkout, git, poll_seconds=0)
     assert not paths.record.exists()
 
@@ -273,10 +344,10 @@ def test_watchdog_stops_backend_for_deleted_worktree(
         "root": str(checkout),
         "pid": 42,
         "port": 9121,
-        "endpoint": lifecycle.endpoint_for_port(9121),
+        "endpoint": process.endpoint_for_port(9121),
         "process": {"pid": 42},
     }
-    lifecycle.write_json_atomically(paths.record, record)
+    process.write_json_atomically(paths.record, record)
     def process_is_alive(_pid: int) -> bool:
         return True
 
@@ -284,7 +355,7 @@ def test_watchdog_stops_backend_for_deleted_worktree(
         return value == record
 
     def active_lease(
-        _paths: lifecycle.StatePaths,
+        _paths: models.StatePaths,
         _checkout: Path,
         *,
         remove_stale: bool = True,
@@ -298,8 +369,8 @@ def test_watchdog_stops_backend_for_deleted_worktree(
             }
         ], 0
 
-    monkeypatch.setattr(lifecycle, "is_process_alive", process_is_alive)
-    monkeypatch.setattr(lifecycle, "terminate_verified_serena", terminate_record)
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "terminate_verified_serena", terminate_record)
     monkeypatch.setattr(
         lifecycle,
         "inspect_leases",

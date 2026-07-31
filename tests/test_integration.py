@@ -14,7 +14,8 @@ import pytest
 from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from serena_shared import lifecycle
+from serena_shared.runtime import lifecycle, process
+from serena_shared.runtime import leases as runtime_leases
 
 
 pytestmark = pytest.mark.skipif(
@@ -156,14 +157,14 @@ def test_open_stdio_client_restarts_idle_backend_transparently(tmp_path: Path) -
             paths = lifecycle.paths_for_checkout(
                 resolved.common_git_dir, resolved.root
             )
-            original = lifecycle.read_json(paths.record)
+            original = process.read_json(paths.record)
             assert original is not None
-            with lifecycle.file_lock(paths.startup_lock):
-                leases = lifecycle.lease_paths(paths)
+            with process.file_lock(paths.startup_lock):
+                leases = runtime_leases.lease_paths(paths)
                 assert len(leases) == 1
-                lease = lifecycle.read_json(leases[0])
+                lease = process.read_json(leases[0])
                 assert lease is not None
-                lifecycle.write_json_atomically(
+                process.write_json_atomically(
                     leases[0], {**lease, "lastActivityAt": time.time() - 120}
                 )
             deadline = time.monotonic() + 20
@@ -172,7 +173,7 @@ def test_open_stdio_client_restarts_idle_backend_transparently(tmp_path: Path) -
             assert not paths.record.exists()
             await anyio.sleep(0.2)
             second = await client.call_tool("echo", {"value": "after"})
-            restarted = lifecycle.read_json(paths.record)
+            restarted = process.read_json(paths.record)
             assert restarted is not None
             assert first.structured_content == {"result": "before"}
             assert second.structured_content == {"result": "after"}

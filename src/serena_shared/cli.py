@@ -9,14 +9,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
-from .lifecycle import (
+from .runtime.lifecycle import (
     backend_identity,
     create_proxy_lease,
     ensure_backend,
     run_watchdog,
     status,
 )
-from .transport import bridge_stdio, probe_mcp
+from .transport.protocol import bridge_stdio, probe_mcp
 
 
 def parser() -> argparse.ArgumentParser:
