@@ -11,4 +11,8 @@ dist/
 # Lockfile-managed skills
 .agents/skills/*
 
+# Serena doesn't do onboarding or memories in this repo
 .serena
+
+# Ignore IDE files
+.vscode
