@@ -51,7 +51,16 @@ enabled = false
 
 [mcp_servers.serena]
 command = "serena-shared"
-args = ["proxy"]
+args = [
+  "proxy",
+  "--",
+  "--context",
+  ".codex/serena/contexts/codex.yml",
+  "--mode",
+  "one-shot",
+  "--mode",
+  "no-memories"
+]
 enabled_tools = [
   "initial_instructions",
   "get_current_config",

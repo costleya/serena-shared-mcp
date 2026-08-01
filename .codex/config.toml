@@ -9,7 +9,16 @@ default_subagent_reasoning_effort = "medium"
 
 [mcp_servers.serena]
 command = "serena-shared"
-args = ["proxy"]
+args = [
+  "proxy",
+  "--",
+  "--context",
+  ".codex/serena/contexts/codex.yml",
+  "--mode",
+  "one-shot",
+  "--mode",
+  "no-memories"
+]
 
 [mcp_servers.grepai]
 command = "grepai"
