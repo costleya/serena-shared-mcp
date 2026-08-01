@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "context-mode hook codex pretooluse"
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/context-mode-hook.mjs\" pretooluse"
           }
         ]
       },
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "context-mode hook codex posttooluse"
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/context-mode-hook.mjs\" posttooluse"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "context-mode hook codex sessionstart"
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/context-mode-hook.mjs\" sessionstart"
           }
         ]
       }
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "context-mode hook codex precompact"
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/context-mode-hook.mjs\" precompact"
           }
         ]
       }
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "context-mode hook codex userpromptsubmit"
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/context-mode-hook.mjs\" userpromptsubmit"
           }
         ]
       }
@@ -67,7 +67,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "context-mode hook codex stop"
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/context-mode-hook.mjs\" stop"
           }
         ]
       }

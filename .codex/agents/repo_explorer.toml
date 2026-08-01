@@ -50,3 +50,7 @@ enabled_tools = [
   "get_diagnostics_for_file",
   "search_for_pattern"
 ]
+
+[mcp_servers.context-mode]
+enabled = false
+command = "context-mode"

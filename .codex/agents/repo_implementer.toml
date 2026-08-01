@@ -40,3 +40,7 @@ args = [
   "--mode",
   "no-memories"
 ]
+
+[mcp_servers.context-mode]
+enabled = false
+command = "context-mode"

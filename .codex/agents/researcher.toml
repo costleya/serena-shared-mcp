@@ -51,3 +51,7 @@ args = ["mcp-serve"]
 enabled = true
 url = "https://mcp.context7.com/mcp"
 default_tools_approval_mode = "approve"
+
+[mcp_servers.context-mode]
+enabled = false
+command = "context-mode"
