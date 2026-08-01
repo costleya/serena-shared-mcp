@@ -49,29 +49,10 @@ enabled = false
 "src/serena_shared/__pycache__" = "write"
 "tests/__pycache__" = "write"
 
-[mcp_servers.serena]
-command = "serena-shared"
-args = [
-  "proxy",
-  "--",
-  "--context",
-  ".codex/serena/contexts/codex.yml",
-  "--mode",
-  "one-shot",
-  "--mode",
-  "no-memories"
-]
-enabled_tools = [
-  "initial_instructions",
-  "get_current_config",
-  "get_symbols_overview",
-  "find_symbol",
-  "find_declaration",
-  "find_implementations",
-  "find_referencing_symbols",
-  "get_diagnostics_for_file",
-  "search_for_pattern"
-]
+[mcp_servers.grepai]
+enabled = false
+command = "grepai"
+args = ["mcp-serve"]
 
 [mcp_servers.context-mode]
 enabled = false
