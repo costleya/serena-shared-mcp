@@ -137,10 +137,11 @@ async def bridge_stdio_async(
     from .bridge import StdioHttpBridge
 
     async with stdio_server() as (stdio_read, stdio_write):
-        bridge = StdioHttpBridge(
-            stdio_read, stdio_write, endpoint_provider, identity_provider, lease
-        )
-        await bridge.run()
+        async with stdio_write:
+            bridge = StdioHttpBridge(
+                stdio_read, stdio_write, endpoint_provider, identity_provider, lease
+            )
+            await bridge.run()
 
 
 def bridge_stdio(
