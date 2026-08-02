@@ -1,7 +1,7 @@
 name = "researcher"
 description = "Research current external documentation and compatibility questions without repository access."
 model = "gpt-5.6-luna"
-model_reasoning_effort = "low"
+model_reasoning_effort = "medium"
 default_permissions = "docs-no-workspace-read"
 nickname_candidates = ["senku", "taiju", "yuzuriha", "kohaku", "chrome", "gen", "suika", "ryusui", "tsukasa"]
 

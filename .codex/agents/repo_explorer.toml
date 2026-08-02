@@ -1,6 +1,6 @@
 name = "repo_explorer"
 description = "Answer focused read-only repository discovery questions with GrepAI and Serena."
-model = "gpt-5.6-luna"
+model = "gpt-5.3-codex-spark"
 model_reasoning_effort = "medium"
 sandbox_mode = "read-only"
 nickname_candidates = ["vaporeon", "jolteon", "flareon", "espeon", "umbreon", "leafeon", "glaceon", "sylveon"]
