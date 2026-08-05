@@ -229,7 +229,8 @@ def _status_for_paths(
             "nextShutdownAt": None, "watchdogHealthy": False,
         }
     healthy = bool(
-        _process.is_process_alive(record["pid"])
+        record["state"] == "active"
+        and _process.is_process_alive(record["pid"])
         and _process.has_matching_record_fingerprint(record)
         and probe(record["endpoint"])
     )

@@ -17,6 +17,37 @@ def default_profile() -> models.RuntimeProfile:
     return lifecycle.profile_from_key()
 
 
+def _fingerprint(checkout: Path, pid: int, port: int) -> dict[str, Any]:
+    return {
+        "pid": pid,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": f"serena start-mcp-server --port {port} --project {checkout}",
+    }
+
+
+def _pending_record(
+    checkout: Path,
+    paths: Any,
+    profile: models.RuntimeProfile,
+    *,
+    pid: int,
+    port: int,
+    fingerprint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "root": str(checkout),
+        "pid": pid,
+        "port": port,
+        "endpoint": process.endpoint_for_port(port),
+        "log": str(paths.log),
+        "process": fingerprint,
+        "fingerprintAvailable": fingerprint is not None,
+        "state": "pending",
+        "profile": profile.as_record(),
+        "probeState": "not-started",
+    }
+
+
 def test_paths_are_worktree_specific_and_share_port_lock(tmp_path: Path) -> None:
     profile = default_profile()
     first = lifecycle.paths_for_checkout(tmp_path, "/checkout/one", profile=profile)
@@ -188,6 +219,233 @@ def test_start_reuses_healthy_profile_record(tmp_path: Path, monkeypatch: pytest
     ) == record
 
 
+def test_start_persists_pending_record_before_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
+    fingerprint = _fingerprint(checkout, 501, 9123)
+    observed: dict[str, Any] = {}
+    clock = iter((0.0, 0.0, 0.0, 0.0, 2.0))
+
+    def find_port(_attempted: set[int] | None = None) -> int:
+        return 9123
+
+    def start_process(*_args: Any) -> int:
+        return 501
+
+    def process_is_alive(_pid: int) -> bool:
+        return True
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    def process_fingerprint(_pid: int) -> dict[str, Any]:
+        observed.update(process.read_json(paths.record) or {})
+        return fingerprint
+
+    monkeypatch.setattr(process, "find_available_port", find_port)
+    monkeypatch.setattr(process, "start_serena", start_process)
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "STARTUP_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(process.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(process.time, "sleep", no_sleep)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+
+    with pytest.raises(RuntimeError, match=r"pending.*probe failed"):
+        process.start_shared_serena(
+            checkout, tmp_path / "git", lambda _endpoint: False, profile, []
+        )
+
+    assert observed["pid"] == 501
+    assert observed["state"] == "pending"
+    assert observed["fingerprintAvailable"] is False
+
+
+def test_start_adopts_verified_pending_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
+    fingerprint = _fingerprint(checkout, 502, 9124)
+    process.write_json_atomically(
+        paths.record,
+        _pending_record(
+            checkout, paths, profile, pid=502, port=9124, fingerprint=None
+        ),
+    )
+
+    def process_is_alive(_pid: int) -> bool:
+        return True
+
+    def process_fingerprint(_pid: int) -> dict[str, Any]:
+        return fingerprint
+
+    def fail_start(*_args: Any) -> NoReturn:
+        pytest.fail("must adopt pending backend")
+
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+    monkeypatch.setattr(process, "start_serena", fail_start)
+
+    result = process.start_shared_serena(
+        checkout, tmp_path / "git", lambda _endpoint: True, profile, []
+    )
+
+    assert result["pid"] == 502
+    assert result["state"] == "active"
+    assert result["process"] == fingerprint
+    assert result.get("probeState") == "succeeded"
+
+
+def test_pending_launch_allows_fingerprint_to_stabilize_before_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
+    pending = _pending_record(
+        checkout, paths, profile, pid=506, port=9128, fingerprint=None
+    )
+    process.write_json_atomically(paths.record, pending)
+    first = _fingerprint(checkout, 506, 9128)
+    first["command"] = f"/tmp/bin/serena start-mcp-server --port 9128 --project {checkout}"
+    second = _fingerprint(checkout, 506, 9128)
+    second["command"] = (
+        f"/usr/bin/python /tmp/bin/serena start-mcp-server "
+        f"--port 9128 --project {checkout}"
+    )
+    fingerprints = iter((first, second))
+    probes = iter((False, True))
+    clock = iter((0.0, 0.0, 0.0))
+
+    def process_is_alive(_pid: int) -> bool:
+        return True
+
+    def process_fingerprint(_pid: int) -> dict[str, Any]:
+        return next(fingerprints)
+
+    def probe(_endpoint: str) -> bool:
+        return next(probes)
+
+    def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+    monkeypatch.setattr(process, "STARTUP_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(process.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(process.time, "sleep", no_sleep)
+
+    recovered = process.recover_pending_serena(
+        paths.record, cast(models.SerenaRecord, pending), probe
+    )
+
+    assert recovered is not None
+    assert recovered["state"] == "active"
+    assert recovered["process"] == second
+    assert recovered.get("probeState") == "succeeded"
+
+
+def test_dead_pending_record_is_replaced_once_then_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
+    process.write_json_atomically(
+        paths.record,
+        _pending_record(
+            checkout, paths, profile, pid=503, port=9125, fingerprint=None
+        ),
+    )
+    replacement = _fingerprint(checkout, 504, 9126)
+    starts: list[int] = []
+
+    def process_is_alive(pid: int) -> bool:
+        return pid == 504
+
+    def process_fingerprint(pid: int) -> dict[str, Any] | None:
+        return replacement if pid == 504 else None
+
+    def find_port(_attempted: set[int] | None = None) -> int:
+        return 9126
+
+    def start_process(*_args: Any) -> int:
+        starts.append(1)
+        return 504
+
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+    monkeypatch.setattr(process, "find_available_port", find_port)
+    monkeypatch.setattr(process, "start_serena", start_process)
+
+    first = process.start_shared_serena(
+        checkout, tmp_path / "git", lambda _endpoint: True, profile, []
+    )
+    second = process.start_shared_serena(
+        checkout, tmp_path / "git", lambda _endpoint: True, profile, []
+    )
+
+    assert first["pid"] == second["pid"] == 504
+    assert starts == [1]
+
+
+def test_live_unverified_pending_record_is_not_replaced_or_terminated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
+    unrelated: dict[str, Any] = {
+        "pid": 505,
+        "startedAt": "other",
+        "command": "unrelated",
+    }
+    pending = _pending_record(
+        checkout, paths, profile, pid=505, port=9127, fingerprint=unrelated
+    )
+    process.write_json_atomically(paths.record, pending)
+    terminated: list[int] = []
+
+    def process_is_alive(_pid: int) -> bool:
+        return True
+
+    def process_fingerprint(_pid: int) -> dict[str, Any]:
+        return unrelated
+
+    def terminate(record: dict[str, Any]) -> bool:
+        terminated.append(record["pid"])
+        return True
+
+    def fail_start(*_args: Any) -> NoReturn:
+        pytest.fail("must not replace unverified pending backend")
+
+    monkeypatch.setattr(process, "is_process_alive", process_is_alive)
+    monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
+    monkeypatch.setattr(process, "terminate_verified_serena", terminate)
+    monkeypatch.setattr(process, "start_serena", fail_start)
+
+    with pytest.raises(RuntimeError, match=r"pending.*fingerprint-mismatch"):
+        process.start_shared_serena(
+            checkout, tmp_path / "git", lambda _endpoint: True, profile, []
+        )
+
+    assert terminated == []
+    retained = process.read_json(paths.record)
+    assert retained is not None
+    assert retained["pid"] == 505
+    assert retained["state"] == "pending"
+    assert retained["probeState"] == "fingerprint-mismatch"
+
+
 def test_process_start_uses_verified_serena_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -240,14 +498,14 @@ def test_process_termination_kills_owned_process_without_lifecycle_forwarding(
     assert kill_calls == 1
 
 
-def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_startup_preserves_verified_process_as_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    fingerprint_record: dict[str, Any] = {
-        "pid": 321,
-        "startedAt": "Thu Jul 30 00:00:00 2026",
-        "command": f"serena start-mcp-server --port 9121 --project {checkout}",
-    }
+    profile = default_profile()
+    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
+    fingerprint_record = _fingerprint(checkout, 321, 9121)
 
     def find_port(_attempted: set[int] | None = None) -> int:
         return 9121
@@ -261,22 +519,22 @@ def test_failed_startup_contains_verified_process(tmp_path: Path, monkeypatch: p
     def process_is_alive(_pid: int) -> bool:
         return True
 
-    def terminate_process(_record: dict[str, Any]) -> bool:
-        return True
-
     monkeypatch.setattr(process, "find_available_port", find_port)
     monkeypatch.setattr(process, "start_serena", start_process)
     monkeypatch.setattr(process, "process_fingerprint", process_fingerprint)
     monkeypatch.setattr(process, "is_process_alive", process_is_alive)
-    monkeypatch.setattr(process, "terminate_verified_serena", terminate_process)
     monkeypatch.setattr(process, "STARTUP_TIMEOUT_SECONDS", 0)
-    profile = default_profile()
-    with pytest.raises(RuntimeError, match="contained"):
+
+    with pytest.raises(RuntimeError, match=r"pending.*PID 321.*probe not-started"):
         process.start_shared_serena(
-            checkout, tmp_path / "git", lambda endpoint: False, profile, []
+            checkout, tmp_path / "git", lambda _endpoint: False, profile, []
         )
-    paths = lifecycle.paths_for_checkout(tmp_path / "git", checkout, profile=profile)
-    assert process.read_json(paths.record) is None
+
+    pending = process.read_json(paths.record)
+    assert pending is not None
+    assert pending["pid"] == 321
+    assert pending["state"] == "pending"
+    assert pending["fingerprintAvailable"] is False
 
 
 def test_inspect_leases_removes_dead_and_retains_verified_proxy(

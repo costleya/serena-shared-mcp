@@ -49,6 +49,11 @@ enabled = false
 "src/serena_shared/__pycache__" = "write"
 "tests/__pycache__" = "write"
 
+[mcp_servers.serena]
+enabled = false
+command = "serena-shared"
+args = ["proxy"]
+
 [mcp_servers.grepai]
 enabled = false
 command = "grepai"

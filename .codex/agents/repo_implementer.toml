@@ -30,6 +30,8 @@ enabled = false
 
 [mcp_servers.serena]
 command = "serena-shared"
+startup_timeout_sec = 60
+required = true
 args = [
   "proxy",
   "--",

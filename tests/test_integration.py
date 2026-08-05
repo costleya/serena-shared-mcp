@@ -97,24 +97,31 @@ def exercise_bridge(tmp_path: Path, fake_source: str, python: str) -> None:
         )
 
     async def call_from_two_clients() -> None:
-        async with Client(stdio_client(params), read_timeout_seconds=10) as first_client:
-            first = await first_client.call_tool("echo", {"value": "first"})
-            status_one = read_status()
-            async with Client(stdio_client(params), read_timeout_seconds=10) as second_client:
-                second = await second_client.call_tool("echo", {"value": "second"})
-                status_two = read_status()
-                assert first.structured_content == {"result": "first"}
-                assert second.structured_content == {"result": "second"}
-                assert status_one["healthy"] and status_two["healthy"]
-                first_profiles = status_one["profiles"]
-                second_profiles = status_two["profiles"]
-                assert isinstance(first_profiles, list) and isinstance(second_profiles, list)
-                first_entry = cast(dict[str, Any], first_profiles[0])
-                second_entry = cast(dict[str, Any], second_profiles[0])
-                first_record = first_entry["record"]
-                second_record = second_entry["record"]
-                assert isinstance(first_record, dict) and isinstance(second_record, dict)
-                assert first_record["pid"] == second_record["pid"]
+        results: dict[str, Any] = {}
+        statuses: dict[str, dict[str, Any]] = {}
+
+        async def call_client(label: str, value: str) -> None:
+            async with Client(stdio_client(params), read_timeout_seconds=10) as client:
+                results[label] = await client.call_tool("echo", {"value": value})
+                statuses[label] = read_status()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(call_client, "first", "first")
+            task_group.start_soon(call_client, "second", "second")
+
+        assert results["first"].structured_content == {"result": "first"}
+        assert results["second"].structured_content == {"result": "second"}
+        assert statuses["first"]["healthy"] and statuses["second"]["healthy"]
+
+        records: list[dict[str, Any]] = []
+        for status in statuses.values():
+            profiles = status["profiles"]
+            assert isinstance(profiles, list) and profiles
+            entry = cast(dict[str, Any], profiles[0])
+            record = entry["record"]
+            assert isinstance(record, dict)
+            records.append(cast(dict[str, Any], record))
+        assert records[0]["pid"] == records[1]["pid"]
 
     anyio.run(call_from_two_clients)
 

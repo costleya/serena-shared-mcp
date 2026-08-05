@@ -117,6 +117,7 @@ class SerenaRecord(TypedDict):
     fingerprintAvailable: bool
     state: str
     profile: RuntimeProfileRecord
+    probeState: NotRequired[str]
     watchdog: NotRequired[WatchdogRecord]
 
 
@@ -126,6 +127,7 @@ def is_serena_record(value: object) -> TypeGuard[SerenaRecord]:
         return False
     process = value["process"]
     watchdog = value.get("watchdog")
+    probe_state = value.get("probeState")
     return (
         isinstance(value.get("root"), str)
         and isinstance(value.get("pid"), int)
@@ -136,6 +138,7 @@ def is_serena_record(value: object) -> TypeGuard[SerenaRecord]:
         and isinstance(value.get("fingerprintAvailable"), bool)
         and isinstance(value.get("state"), str)
         and is_runtime_profile_record(value.get("profile"))
+        and ("probeState" not in value or isinstance(probe_state, str))
         and ("watchdog" not in value or is_watchdog_record(watchdog))
     )
 

@@ -14,7 +14,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Generator, Mapping, Sequence, TypeGuard
+from typing import Any, Callable, Generator, Mapping, Sequence, TypeGuard, cast
 
 from serena_shared._typing import is_json_object
 
@@ -201,13 +201,73 @@ def create_serena_record(
     process: ProcessFingerprint | None,
     state: str,
     profile: RuntimeProfile,
+    probe_state: str = "not-started",
 ) -> SerenaRecord:
     value: SerenaRecord = {
         "root": os.fspath(checkout), "pid": pid, "port": port, "endpoint": endpoint,
         "log": os.fspath(log), "process": process, "fingerprintAvailable": process is not None,
-        "state": state, "profile": profile.as_record(),
+        "state": state, "profile": profile.as_record(), "probeState": probe_state,
     }
     return value
+
+
+def pending_startup_diagnostic(record: SerenaRecord, probe_state: str) -> str:
+    return (
+        "Shared Serena startup remains pending "
+        f"(PID {record["pid"]}, endpoint {record["endpoint"]}, "
+        f"profile {record["profile"]["profileKey"]!r}, probe {probe_state})."
+    )
+
+
+def recover_pending_serena(
+    record_path: Path,
+    record: SerenaRecord,
+    probe: Callable[[str], bool],
+) -> SerenaRecord | None:
+    """Wait for a pending launch and promote only a verified, probed backend."""
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    pending = record
+    probe_state = pending.get("probeState", "not-started")
+    while time.monotonic() < deadline:
+        if not is_process_alive(pending["pid"]):
+            return None
+        fingerprint = process_fingerprint(pending["pid"])
+        if fingerprint is None:
+            probe_state = "fingerprint-unavailable"
+        else:
+            recorded_fingerprint = pending["process"]
+            if recorded_fingerprint is not None and not is_same_process_fingerprint(
+                fingerprint, recorded_fingerprint
+            ):
+                pending["probeState"] = "fingerprint-mismatch"
+                write_json_atomically(record_path, pending)
+                return None
+            candidate = cast(
+                SerenaRecord,
+                {**pending, "process": fingerprint, "fingerprintAvailable": True},
+            )
+            if not is_serena_fingerprint(fingerprint, candidate):
+                if recorded_fingerprint is not None:
+                    pending["probeState"] = "fingerprint-mismatch"
+                    write_json_atomically(record_path, pending)
+                    return None
+                probe_state = "fingerprint-unverified"
+            else:
+                if probe(candidate["endpoint"]):
+                    active = cast(
+                        SerenaRecord,
+                        {**candidate, "state": "active", "probeState": "succeeded"},
+                    )
+                    write_json_atomically(record_path, active)
+                    return active
+                probe_state = "failed"
+        pending = cast(
+            SerenaRecord,
+            {**pending, "state": "pending", "probeState": probe_state},
+        )
+        write_json_atomically(record_path, pending)
+        time.sleep(POLL_INTERVAL_SECONDS)
+    return None
 
 
 def start_serena(
@@ -283,23 +343,31 @@ def start_shared_serena(
         if existing:
             if not is_registry_record_for_profile(existing, checkout, profile):
                 paths.record.unlink(missing_ok=True)
-            elif is_process_alive(existing["pid"]):
-                if not is_owned_serena(existing):
+            elif not is_process_alive(existing["pid"]):
+                paths.record.unlink(missing_ok=True)
+            elif existing.get("state") == "pending":
+                recovered = recover_pending_serena(paths.record, existing, probe)
+                if recovered is not None:
+                    return recovered
+                latest = read_json(paths.record)
+                if is_registry_record_for_profile(latest, checkout, profile):
+                    existing = latest
+                if not is_process_alive(existing["pid"]):
                     paths.record.unlink(missing_ok=True)
-                elif existing.get("state") == "pending":
-                    actual = process_fingerprint(existing["pid"])
-                    if actual and is_serena_fingerprint(actual, existing) and probe(existing["endpoint"]):
-                        active: SerenaRecord = {**existing, "process": actual, "state": "active"}
-                        write_json_atomically(paths.record, active)
-                        return active
-                    raise RuntimeError(f"Shared Serena startup remains pending verification for {checkout}.")
-                elif probe(existing["endpoint"]):
-                    return existing
                 else:
-                    if not terminate_verified_serena(existing):
-                        raise RuntimeError(f"Refusing to replace an unverified live shared Serena process for {checkout}.")
-                    paths.record.unlink(missing_ok=True)
+                    probe_state = existing.get("probeState", "unverified")
+                    raise RuntimeError(pending_startup_diagnostic(existing, probe_state))
+            elif not is_owned_serena(existing):
+                paths.record.unlink(missing_ok=True)
+            elif probe(existing["endpoint"]):
+                return existing
             else:
+                if not terminate_verified_serena(existing):
+                    raise RuntimeError(
+                        "Refusing to replace an unverified live shared Serena process "
+                        f"(PID {existing["pid"]}, endpoint {existing["endpoint"]}, "
+                        f"profile {existing["profile"]["profileKey"]!r}, probe failed)."
+                    )
                 paths.record.unlink(missing_ok=True)
 
         with file_lock(paths.port_lock):
@@ -308,46 +376,23 @@ def start_shared_serena(
                 port = find_available_port(attempted)
                 attempted.add(port)
                 endpoint = endpoint_for_port(port)
-                pid: int | None = None
-                fingerprint: ProcessFingerprint | None = None
-                try:
-                    pid = start_serena(checkout, port, paths.log, serena_args)
-                    initial = process_fingerprint(pid)
-                    if initial:
-                        initial_record = create_serena_record(checkout, endpoint, paths.log, pid, port, initial, "pending", profile)
-                        if is_serena_fingerprint(initial, initial_record):
-                            fingerprint = initial
-                    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
-                    while time.monotonic() < deadline:
-                        if not is_process_alive(pid):
-                            break
-                        current = process_fingerprint(pid)
-                        if current:
-                            candidate = create_serena_record(checkout, endpoint, paths.log, pid, port, current, "pending", profile)
-                            if is_serena_fingerprint(current, candidate):
-                                fingerprint = current
-                            elif fingerprint:
-                                break
-                        if probe(endpoint):
-                            if not fingerprint:
-                                raise RuntimeError("Shared Serena process fingerprint could not be verified.")
-                            record = create_serena_record(checkout, endpoint, paths.log, pid, port, fingerprint, "active", profile)
-                            write_json_atomically(paths.record, record)
-                            return record
-                        time.sleep(POLL_INTERVAL_SECONDS)
-                    if not is_process_alive(pid):
-                        continue
-                    raise RuntimeError(f"Shared Serena startup could not be verified for {checkout}; leaving PID {pid} pending.")
-                except Exception as error:
-                    if pid is None:
-                        raise
-                    record = create_serena_record(checkout, endpoint, paths.log, pid, port, fingerprint, "pending", profile)
-                    if fingerprint and terminate_verified_serena(record):
-                        raise RuntimeError(f"Shared Serena startup was contained after failure for {checkout}.") from error
-                    if is_process_alive(pid):
-                        write_json_atomically(paths.record, record)
-                        raise RuntimeError(f"Shared Serena startup could not be verified for {checkout}; leaving PID {pid} pending.") from error
-                    raise
+                pid = start_serena(checkout, port, paths.log, serena_args)
+                pending = create_serena_record(
+                    checkout, endpoint, paths.log, pid, port, None, "pending", profile,
+                )
+                # Persist before fingerprinting or probing so an interrupted cold start is recoverable.
+                write_json_atomically(paths.record, pending)
+                recovered = recover_pending_serena(paths.record, pending, probe)
+                if recovered is not None:
+                    return recovered
+                latest = read_json(paths.record)
+                if is_registry_record_for_profile(latest, checkout, profile):
+                    pending = latest
+                if not is_process_alive(pid):
+                    paths.record.unlink(missing_ok=True)
+                    continue
+                probe_state = pending.get("probeState", "unverified")
+                raise RuntimeError(pending_startup_diagnostic(pending, probe_state))
             raise RuntimeError(f"Shared Serena did not become healthy. See {paths.log}.")
 
 
