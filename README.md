@@ -43,15 +43,21 @@ checkout:
 ```json
 {
   "command": "serena-shared",
-  "args": ["proxy", "--idle-timeout-minutes", "15"]
+  "args": ["proxy", "--idle-timeout-minutes", "5"]
 }
 ```
 
-`proxy` is the default command, and the idle timeout defaults to 15 minutes, so
+`proxy` is the default command, and the idle timeout defaults to 5 minutes, so
 an empty argument list is equivalent. The lightweight stdio proxy stays
 connected, while the heavier Serena and language-server processes stop after
 the configured period without completed requests. A later request starts and
-reinitializes Serena transparently.
+reinitializes Serena transparently. Startup and discovery remain lightweight:
+the backend starts without a project or language server, and the proxy activates
+its checkout only for the first real `tools/call` in each backend generation.
+This requires a Serena context that exposes `activate_project`. Contexts with
+`single_project: true` are unsupported by the lazy proxy: Serena fixes their
+reduced tool set at startup and disables project switching, so activating after
+discovery cannot provide an equivalent tool surface.
 
 ## CLI and Serena pass-through
 
@@ -76,7 +82,7 @@ A backend identity is only the Git checkout and a nullable profile key. Within
 one checkout and key, the first live backend's forwarded Serena arguments win.
 When that backend is restarted, the invocation that triggers the restart
 supplies its current forwarded arguments. Different profile keys run
-independently. The idle timeout defaults to 15 minutes.
+independently. The idle timeout defaults to 5 minutes.
 
 ## MCP version compatibility
 

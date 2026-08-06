@@ -212,5 +212,5 @@ def test_serena_start_uses_fixed_managed_arguments_then_exact_tail(
         "--port",
         "9121",
     ]
-    assert argv[8:10] == ["--project", str(checkout)]
-    assert argv[10:] == ["--log-level", "debug", "--feature=x"]
+    assert argv[8:] == ["--log-level", "debug", "--feature=x"]
+    assert "--project" not in argv

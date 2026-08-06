@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Any, cast
 
 import anyio
+from serena_shared.runtime.models import BackendIdentity
 
 from mcp.server.stdio import stdio_server as real_stdio_server
 
@@ -35,6 +36,16 @@ class _Lease:
         pass
 
 
+def _identity() -> BackendIdentity:
+    return (
+        "http://localhost",
+        1,
+        "started",
+        "serena start-mcp-server",
+        "/checkout/project",
+    )
+
+
 def test_bridge_stdio_async_exits_after_real_stdio_input_eof(
     monkeypatch: Any,
 ) -> None:
@@ -53,8 +64,8 @@ def test_bridge_stdio_async_exits_after_real_stdio_input_eof(
     async def exercise() -> None:
         with anyio.fail_after(1):
             await protocol.bridge_stdio_async(
-                lambda: ("http://localhost", 1),
-                lambda: ("http://localhost", 1),
+                _identity,
+                _identity,
                 _Lease(),
             )
 

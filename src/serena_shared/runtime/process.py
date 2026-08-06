@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -94,7 +95,38 @@ def process_fingerprint(pid: int) -> ProcessFingerprint | None:
     parts = completed.stdout.strip().split(maxsplit=6)
     if len(parts) != 7 or not parts[0].isdigit():
         return None
-    return {"pid": int(parts[0]), "startedAt": " ".join(parts[1:6]), "command": parts[6]}
+    fingerprint: ProcessFingerprint = {
+        "pid": int(parts[0]),
+        "startedAt": " ".join(parts[1:6]),
+        "command": parts[6],
+    }
+    cwd = process_cwd(pid)
+    if cwd is not None:
+        fingerprint["cwd"] = cwd
+    return fingerprint
+
+
+def process_cwd(pid: int) -> str | None:
+    """Return a process CWD when the platform exposes it without a supervisor."""
+    proc_cwd = Path(f"/proc/{pid}/cwd")
+    try:
+        return os.path.realpath(os.readlink(proc_cwd))
+    except OSError:
+        pass
+    if shutil.which("lsof") is None:
+        return None
+    completed = subprocess.run(
+        ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        return None
+    for line in completed.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return os.path.realpath(line[1:])
+    return None
 
 
 def is_process_alive(pid: int) -> bool:
@@ -123,12 +155,20 @@ def is_process_alive(pid: int) -> bool:
 
 
 def is_same_process_fingerprint(actual: Any, expected: Any) -> bool:
-    return bool(
+    same = bool(
         is_json_object(actual)
         and is_json_object(expected)
         and actual.get("pid") == expected.get("pid")
         and actual.get("startedAt") == expected.get("startedAt")
         and actual.get("command") == expected.get("command")
+    )
+    if not same or not is_json_object(expected):
+        return False
+    expected_cwd = expected.get("cwd")
+    return expected_cwd is None or (
+        isinstance(expected_cwd, str)
+        and is_json_object(actual)
+        and actual.get("cwd") == expected_cwd
     )
 
 
@@ -161,11 +201,68 @@ def is_serena_fingerprint(fingerprint: Any, record: Any) -> bool:
     command = fingerprint.get("command")
     if not isinstance(command, str):
         return False
-    return (
-        "serena start-mcp-server" in command
-        and f"--port {record.get('port')}" in command
-        and f"--project {record.get('root')}" in command
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    direct_launcher = (
+        len(argv) >= 2
+        and Path(argv[0]).name == "serena"
+        and argv[1] == "start-mcp-server"
     )
+    interpreter_launcher = (
+        len(argv) >= 3
+        and _is_python_interpreter(argv[0])
+        and Path(argv[1]).name == "serena"
+        and argv[2] == "start-mcp-server"
+    )
+    if direct_launcher:
+        server_argv = argv[2:]
+    elif interpreter_launcher:
+        server_argv = argv[3:]
+    else:
+        return False
+    if (
+        _option_values(server_argv, "--transport") != ["streamable-http"]
+        or _option_values(server_argv, "--host") != ["127.0.0.1"]
+        or _option_values(server_argv, "--port") != [str(record.get("port"))]
+        or _option_values(server_argv, "--project") != []
+        or _option_values(server_argv, "--project-file") != []
+        or _option_values(server_argv, "--project-from-cwd") != []
+    ):
+        return False
+    recorded = record.get("process")
+    return bool(
+        is_json_object(recorded)
+        and recorded.get("cwd") == record.get("root")
+        and fingerprint.get("cwd") == record.get("root")
+    )
+
+
+def _option_values(argv: list[str], option: str) -> list[str] | None:
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == option:
+            if index + 1 >= len(argv):
+                return None
+            values.append(argv[index + 1])
+            index += 2
+        elif token.startswith(f"{option}="):
+            values.append(token.removeprefix(f"{option}="))
+            index += 1
+        else:
+            index += 1
+    return values
+
+
+def _is_python_interpreter(executable: str) -> bool:
+    name = Path(executable).name.lower()
+    if not name.startswith("python"):
+        return False
+    suffix = name.removeprefix("python")
+    return suffix == "" or all(part.isdigit() for part in suffix.split("."))
 
 
 def has_matching_record_fingerprint(record: SerenaRecord) -> bool:
@@ -292,10 +389,9 @@ def start_serena(
                 "127.0.0.1",
                 "--port",
                 str(port),
-                "--project",
-                os.fspath(checkout),
                 *serena_args,
             ],
+            cwd=checkout,
             stdin=subprocess.DEVNULL,
             stdout=stream,
             stderr=subprocess.STDOUT,

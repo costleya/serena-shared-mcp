@@ -148,13 +148,22 @@ def backend_identity(
     paths: _models.StatePaths,
     checkout: Path,
     profile: _models.RuntimeProfile,
-) -> tuple[str, int] | None:
+) -> _models.BackendIdentity | None:
     record = _process.read_json(paths.record)
     if not _process.is_registry_record_for_profile(record, checkout, profile):
         return None
     if not _process.is_owned_serena(record):
         return None
-    return record["endpoint"], record["pid"]
+    process = record["process"]
+    if process is None:
+        return None
+    return (
+        record["endpoint"],
+        record["pid"],
+        process["startedAt"],
+        process["command"],
+        process.get("cwd"),
+    )
 
 
 def create_proxy_lease(

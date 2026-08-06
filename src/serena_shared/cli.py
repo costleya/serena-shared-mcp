@@ -18,6 +18,7 @@ from .runtime.lifecycle import (
     run_watchdog,
     status,
 )
+from .runtime.models import BackendIdentity
 from .transport.protocol import bridge_stdio, probe_mcp
 
 
@@ -86,9 +87,9 @@ def parser() -> _ArgumentParser:
     value.add_argument(
         "--idle-timeout-minutes",
         type=positive_integer,
-        default=15,
+        default=5,
         metavar="MINUTES",
-        help="stop the Serena backend after this many idle minutes (default: 15)",
+        help="stop the Serena backend after this many idle minutes (default: 5)",
     )
     return value
 
@@ -116,20 +117,25 @@ def run(argv: Sequence[str] | None = None, cwd: Path | str | None = None) -> int
             cwd=cwd,
         )
         try:
-            def endpoint() -> tuple[str, int]:
-                record = ensure_backend(
+            def endpoint() -> BackendIdentity:
+                ensure_backend(
                     lease.checkout,
                     lease.paths,
                     probe_mcp,
                     lease.profile,
                     lease.serena_args,
                 )
-                return str(record["endpoint"]), int(record["pid"])
+                current = backend_identity(
+                    lease.paths, lease.checkout.root, lease.profile
+                )
+                if current is None:
+                    raise RuntimeError("Shared Serena backend ownership could not be verified.")
+                return current
 
-            def identity() -> tuple[str, int] | None:
+            def identity() -> BackendIdentity | None:
                 return backend_identity(lease.paths, lease.checkout.root, lease.profile)
 
-            bridge_stdio(endpoint, identity, lease)
+            bridge_stdio(endpoint, identity, lease, str(lease.checkout.root))
         finally:
             lease.close()
         return 0

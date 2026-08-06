@@ -55,6 +55,10 @@ class ProcessFingerprint(TypedDict):
     pid: int
     startedAt: str
     command: str
+    cwd: NotRequired[str]
+
+
+type BackendIdentity = tuple[str, int, str, str, str | None]
 
 
 def is_process_fingerprint(value: object) -> TypeGuard[ProcessFingerprint]:
@@ -65,6 +69,7 @@ def is_process_fingerprint(value: object) -> TypeGuard[ProcessFingerprint]:
         isinstance(value.get("pid"), int)
         and isinstance(value.get("startedAt"), str)
         and isinstance(value.get("command"), str)
+        and ("cwd" not in value or isinstance(value.get("cwd"), str))
     )
 
 

@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Protocol, cast
 
 from serena_shared._typing import is_json_object
+from serena_shared.runtime.models import BackendIdentity
 
 import anyio
 from mcp import Client
@@ -19,6 +20,7 @@ from mcp.shared.inbound import (
     encode_header_value,
 )
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
+from mcp.types import JSONRPCRequest
 
 PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
 
@@ -102,6 +104,22 @@ def message_method(item: SessionMessage) -> str | None:
     return method if isinstance(method, str) else None
 
 
+def message_protocol_version(item: SessionMessage) -> str | None:
+    meta = message_metadata(item)
+    if meta is None:
+        return None
+    version = meta.get(PROTOCOL_VERSION_META_KEY)
+    return version if isinstance(version, str) else None
+
+
+def message_metadata(item: SessionMessage) -> dict[str, object] | None:
+    params = _message_params(item.message)
+    if params is None:
+        return None
+    meta = params.get("_meta")
+    return dict(meta) if is_json_object(meta) else None
+
+
 def message_id(item: SessionMessage) -> int | str | None:
     value = getattr(item.message, "id", None)
     return value if isinstance(value, (int, str)) else None
@@ -128,10 +146,67 @@ async def replay_initialization(
         await http_write.send(adapt_client_message(initialized))
 
 
+async def activate_project(
+    http_read: Any,
+    http_write: Any,
+    project: str,
+    metadata: Mapping[str, object] | None,
+) -> None:
+    """Activate a checkout and wait for Serena to finish starting its LSP."""
+    request_id = f"serena-shared-activate-{uuid.uuid4().hex}"
+    params: dict[str, Any] = {
+        "name": "activate_project",
+        "arguments": {"project": project},
+    }
+    if metadata is not None:
+        params["_meta"] = dict(metadata)
+    request = JSONRPCRequest(
+        jsonrpc="2.0",
+        id=request_id,
+        method="tools/call",
+        params=params,
+    )
+    await http_write.send(adapt_client_message(SessionMessage(request)))
+    while True:
+        response = await http_read.receive()
+        if isinstance(response, Exception):
+            raise response
+        if message_id(response) != request_id:
+            continue
+        payload = response.message.model_dump(mode="json")
+        result = payload.get("result")
+        if "error" in payload or (
+            is_json_object(result) and result.get("isError") is True
+        ):
+            raise RuntimeError(
+                "Serena could not activate the checkout project: "
+                f"{payload.get('error', result)!r}"
+            )
+        return
+
+
+def transport_barrier_request(
+    metadata: Mapping[str, object] | None,
+) -> tuple[str, SessionMessage]:
+    """Create an internal ping whose response confirms preceding POST completion."""
+    request_id = f"serena-shared-barrier-{uuid.uuid4().hex}"
+    params: dict[str, Any] = {}
+    if metadata is not None:
+        params["_meta"] = dict(metadata)
+    request = JSONRPCRequest(
+        jsonrpc="2.0",
+        id=request_id,
+        method="ping",
+        params=params,
+    )
+    return request_id, adapt_client_message(SessionMessage(request))
+
+
 async def bridge_stdio_async(
-    endpoint_provider: Callable[[], tuple[str, int]],
-    identity_provider: Callable[[], tuple[str, int] | None],
+    endpoint_provider: Callable[[], BackendIdentity],
+    identity_provider: Callable[[], BackendIdentity | None],
     lease: ActivityLease,
+    project: str | None = None,
 ) -> None:
     """Relay stdio while reconnecting an automatically reaped HTTP backend."""
     from .bridge import StdioHttpBridge
@@ -139,19 +214,20 @@ async def bridge_stdio_async(
     async with stdio_server() as (stdio_read, stdio_write):
         async with stdio_write:
             bridge = StdioHttpBridge(
-                stdio_read, stdio_write, endpoint_provider, identity_provider, lease
+                stdio_read, stdio_write, endpoint_provider, identity_provider, lease, project
             )
             await bridge.run()
 
 
 def bridge_stdio(
-    endpoint_provider: Callable[[], tuple[str, int]],
-    identity_provider: Callable[[], tuple[str, int] | None],
+    endpoint_provider: Callable[[], BackendIdentity],
+    identity_provider: Callable[[], BackendIdentity | None],
     lease: ActivityLease,
+    project: str | None = None,
 ) -> None:
     try:
         anyio.run(
-            bridge_stdio_async, endpoint_provider, identity_provider, lease
+            bridge_stdio_async, endpoint_provider, identity_provider, lease, project
         )
     except* Exception as group:
         def messages_for(error: BaseException) -> list[str]:

@@ -27,9 +27,9 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
     assert "serena-shared 0.1.0" in capsys.readouterr().out
 
 
-def test_proxy_timeout_defaults_to_fifteen_minutes() -> None:
+def test_proxy_timeout_defaults_to_five_minutes() -> None:
     arguments = cli.parser().parse_args(["proxy"])
-    assert arguments.idle_timeout_minutes == 15
+    assert arguments.idle_timeout_minutes == 5
 
 
 def test_proxy_timeout_accepts_positive_integer_minutes() -> None:

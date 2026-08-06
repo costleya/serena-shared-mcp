@@ -21,7 +21,8 @@ def _fingerprint(checkout: Path, pid: int, port: int) -> dict[str, Any]:
     return {
         "pid": pid,
         "startedAt": "Thu Jul 30 00:00:00 2026",
-        "command": f"serena start-mcp-server --port {port} --project {checkout}",
+        "command": f"serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port {port}",
+        "cwd": str(checkout),
     }
 
 
@@ -149,6 +150,125 @@ def test_process_fingerprint_rejects_non_serena_process(monkeypatch: pytest.Monk
     assert not process.is_serena_fingerprint(fingerprint, record)
 
 
+def _owned_record(root: str, fingerprint: dict[str, Any], port: int = 9121) -> dict[str, Any]:
+    return {
+        "pid": fingerprint["pid"],
+        "port": port,
+        "root": root,
+        "endpoint": process.endpoint_for_port(port),
+        "process": fingerprint,
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 91210",
+        "xserena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+        "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121 --project /other",
+    ],
+)
+def test_serena_fingerprint_rejects_misleading_command_tokens(command: str) -> None:
+    fingerprint = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": command,
+        "cwd": "/checkout",
+    }
+    assert not process.is_serena_fingerprint(
+        fingerprint, _owned_record("/checkout", fingerprint)
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+        "/usr/bin/python /tmp/bin/serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+        "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python /tmp/bin/serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+    ],
+)
+def test_serena_fingerprint_accepts_direct_and_interpreter_wrapped_launches(
+    command: str,
+) -> None:
+    fingerprint = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": command,
+        "cwd": "/checkout",
+    }
+    assert process.is_serena_fingerprint(
+        fingerprint, _owned_record("/checkout", fingerprint)
+    )
+
+
+def test_serena_fingerprint_rejects_decoy_argv_prefix() -> None:
+    fingerprint = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": "python unrelated.py serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+        "cwd": "/checkout",
+    }
+    assert not process.is_serena_fingerprint(
+        fingerprint, _owned_record("/checkout", fingerprint)
+    )
+
+
+def test_serena_fingerprint_rejects_legacy_projected_command() -> None:
+    fingerprint = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121 --project /checkout",
+        "cwd": "/other",
+    }
+    assert not process.is_serena_fingerprint(
+        fingerprint, _owned_record("/checkout", fingerprint)
+    )
+
+
+@pytest.mark.parametrize("cwd", [None, "/other"])
+def test_unprojected_serena_requires_verified_checkout_cwd(cwd: str | None) -> None:
+    fingerprint: dict[str, Any] = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+    }
+    if cwd is not None:
+        fingerprint["cwd"] = cwd
+    assert not process.is_serena_fingerprint(
+        fingerprint, _owned_record("/checkout", fingerprint)
+    )
+
+
+def test_unprojected_serena_with_matching_cwd_is_owned() -> None:
+    fingerprint = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+        "cwd": "/checkout",
+    }
+    assert process.is_serena_fingerprint(
+        fingerprint, _owned_record("/checkout", fingerprint)
+    )
+
+
+def test_backend_identity_changes_when_fingerprint_details_change() -> None:
+    expected = {
+        "pid": 123,
+        "startedAt": "Thu Jul 30 00:00:00 2026",
+        "command": "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121",
+        "cwd": "/checkout",
+    }
+    changes = [
+        ("startedAt", "Thu Jul 30 00:01:00 2026"),
+        ("command", "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9121 --log-level debug"),
+        ("cwd", "/other"),
+    ]
+    for field, value in changes:
+        actual = {**expected, field: value}
+        assert not process.is_same_process_fingerprint(actual, expected)
+
+
 def test_process_liveness_reaps_owned_child(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_waitpid(pid: int, _options: int) -> tuple[int, int]:
         return pid, 0
@@ -187,7 +307,8 @@ def test_start_reuses_healthy_profile_record(tmp_path: Path, monkeypatch: pytest
     fingerprint_record: dict[str, Any] = {
         "pid": 123,
         "startedAt": "Thu Jul 30 00:00:00 2026",
-        "command": f"serena start-mcp-server --port 9123 --project {checkout}",
+        "command": "serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9123",
+        "cwd": str(checkout),
     }
     record: dict[str, Any] = {
         "root": str(checkout),
@@ -314,11 +435,11 @@ def test_pending_launch_allows_fingerprint_to_stabilize_before_activation(
     )
     process.write_json_atomically(paths.record, pending)
     first = _fingerprint(checkout, 506, 9128)
-    first["command"] = f"/tmp/bin/serena start-mcp-server --port 9128 --project {checkout}"
+    first["command"] = "/tmp/bin/serena start-mcp-server --transport streamable-http --host 127.0.0.1 --port 9128"
     second = _fingerprint(checkout, 506, 9128)
     second["command"] = (
         f"/usr/bin/python /tmp/bin/serena start-mcp-server "
-        f"--port 9128 --project {checkout}"
+        "--transport streamable-http --host 127.0.0.1 --port 9128"
     )
     fingerprints = iter((first, second))
     probes = iter((False, True))

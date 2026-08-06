@@ -34,6 +34,10 @@ server = MCPServer("Fake Serena", log_level="ERROR")
 def echo(value: str) -> str:
     return value
 
+@server.tool()
+def activate_project(project: str) -> str:
+    return project
+
 args = sys.argv
 port = int(args[args.index("--port") + 1])
 server.run(
@@ -63,9 +67,12 @@ server = FastMCP(
 def echo(value: str) -> str:
     return value
 
+@server.tool()
+def activate_project(project: str) -> str:
+    return project
+
 server.run("streamable-http")
 """
-
 
 def exercise_bridge(tmp_path: Path, fake_source: str, python: str) -> None:
     checkout = tmp_path / "checkout"
