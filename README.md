@@ -23,17 +23,18 @@ uv tool install -p 3.13 serena-agent
 
 ## Install
 
-After publication:
-
-```sh
-uv tool install -p 3.14 serena-shared-mcp
-```
-
 From this checkout:
 
 ```sh
 uv tool install -p 3.14 .
 ```
+
+After publication (not yet, IF THERE IS DEMAND):
+
+```sh
+uv tool install -p 3.14 serena-shared-mcp
+```
+
 
 ## MCP client configuration
 
