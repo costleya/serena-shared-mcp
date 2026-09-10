@@ -207,6 +207,7 @@ async def bridge_stdio_async(
     identity_provider: Callable[[], BackendIdentity | None],
     lease: ActivityLease,
     project: str | None = None,
+    respect_ignored_paths: bool = False,
 ) -> None:
     """Relay stdio while reconnecting an automatically reaped HTTP backend."""
     from .bridge import StdioHttpBridge
@@ -214,7 +215,13 @@ async def bridge_stdio_async(
     async with stdio_server() as (stdio_read, stdio_write):
         async with stdio_write:
             bridge = StdioHttpBridge(
-                stdio_read, stdio_write, endpoint_provider, identity_provider, lease, project
+                stdio_read,
+                stdio_write,
+                endpoint_provider,
+                identity_provider,
+                lease,
+                project,
+                respect_ignored_paths,
             )
             await bridge.run()
 
@@ -224,10 +231,16 @@ def bridge_stdio(
     identity_provider: Callable[[], BackendIdentity | None],
     lease: ActivityLease,
     project: str | None = None,
+    respect_ignored_paths: bool = False,
 ) -> None:
     try:
         anyio.run(
-            bridge_stdio_async, endpoint_provider, identity_provider, lease, project
+            bridge_stdio_async,
+            endpoint_provider,
+            identity_provider,
+            lease,
+            project,
+            respect_ignored_paths,
         )
     except* Exception as group:
         def messages_for(error: BaseException) -> list[str]:

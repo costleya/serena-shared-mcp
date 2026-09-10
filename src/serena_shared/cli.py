@@ -34,6 +34,7 @@ class _ArgumentParser(argparse.ArgumentParser):
     _proxy_options = frozenset({
         "--profile-key",
         "--idle-timeout-minutes",
+        "--respect-ignored-paths",
     })
 
     def parse_args(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -91,6 +92,11 @@ def parser() -> _ArgumentParser:
         metavar="MINUTES",
         help="stop the Serena backend after this many idle minutes (default: 5)",
     )
+    value.add_argument(
+        "--respect-ignored-paths",
+        action="store_true",
+        help="locally reject search_for_pattern requests that target ignored paths",
+    )
     return value
 
 
@@ -135,7 +141,13 @@ def run(argv: Sequence[str] | None = None, cwd: Path | str | None = None) -> int
             def identity() -> BackendIdentity | None:
                 return backend_identity(lease.paths, lease.checkout.root, lease.profile)
 
-            bridge_stdio(endpoint, identity, lease, str(lease.checkout.root))
+            bridge_stdio(
+                endpoint,
+                identity,
+                lease,
+                project=str(lease.checkout.root),
+                respect_ignored_paths=arguments.respect_ignored_paths,
+            )
         finally:
             lease.close()
         return 0

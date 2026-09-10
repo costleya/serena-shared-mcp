@@ -149,6 +149,266 @@ def _message(identifier: int) -> SessionMessage:
     )
 
 
+def _search_request(
+    identifier: int,
+    *,
+    relative_path: str | None = None,
+    skip_ignored_files: bool | None = None,
+) -> SessionMessage:
+    arguments: dict[str, object] = {}
+    if relative_path is not None:
+        arguments["relative_path"] = relative_path
+    if skip_ignored_files is not None:
+        arguments["skip_ignored_files"] = skip_ignored_files
+    return SessionMessage(
+        JSONRPCRequest(
+            jsonrpc="2.0",
+            id=identifier,
+            method="tools/call",
+            params={"name": "search_for_pattern", "arguments": arguments},
+        )
+    )
+
+
+def test_respect_ignored_paths_rejects_explicit_false_locally() -> None:
+    lease = _CountingLease()
+    client_output = _Write()
+    checker_calls: list[str] = []
+
+    def checker(path: str) -> bool:
+        checker_calls.append(path)
+        raise AssertionError("explicit skip_ignored_files=false must not check a path")
+
+    bridge = bridge_module.StdioHttpBridge(
+        _EmptyReader(),
+        client_output,
+        lambda: _identity(),
+        lambda: _identity(),
+        lease,
+        project="/checkout/project",
+        respect_ignored_paths=True,
+        ignored_path_checker=checker,
+    )
+    request = _search_request(31, skip_ignored_files=False)
+
+    async def exercise() -> None:
+        send, receive = anyio.create_memory_object_stream[SessionMessage](1)
+        async def input_messages() -> Any:
+            yield request
+        bridge._stdio_read = input_messages()
+        await bridge._read_stdio(send)
+        with pytest.raises(anyio.EndOfStream):
+            await receive.receive()
+
+    anyio.run(exercise)
+    assert client_output.sent
+    response = cast(Any, client_output.sent[-1].message)
+    assert response.id == 31
+    assert response.result["isError"] is True
+    assert "skip_ignored_files" in str(response.result)
+    assert checker_calls == []
+    assert lease.started == 0
+    assert lease.finished == 0
+
+
+@pytest.mark.parametrize("skip_ignored_files", [None, True])
+def test_respect_ignored_paths_checks_normalized_relative_path(
+    skip_ignored_files: bool | None,
+) -> None:
+    lease = _CountingLease()
+    client_output = _Write()
+    checked: list[str] = []
+
+    def checker(path: str) -> bool:
+        checked.append(path)
+        return True
+
+    bridge = bridge_module.StdioHttpBridge(
+        _EmptyReader(),
+        client_output,
+        lambda: _identity(),
+        lambda: _identity(),
+        lease,
+        respect_ignored_paths=True,
+        ignored_path_checker=checker,
+        project="/checkout/project",
+    )
+    request = _search_request(
+        32,
+        relative_path="  src/../ignored.txt  ",
+        skip_ignored_files=skip_ignored_files,
+    )
+
+    async def exercise() -> None:
+        send, receive = anyio.create_memory_object_stream[SessionMessage](1)
+        async def input_messages() -> Any:
+            yield request
+        bridge._stdio_read = input_messages()
+        await bridge._read_stdio(send)
+        with pytest.raises(anyio.EndOfStream):
+            await receive.receive()
+
+    anyio.run(exercise)
+    assert checked == ["/checkout/project/ignored.txt"]
+    response = cast(Any, client_output.sent[-1].message)
+    assert response.id == 32
+    assert response.result["isError"] is True
+    assert "ignored" in str(response.result).lower()
+    assert lease.started == 0
+    assert lease.finished == 0
+
+
+def test_respect_ignored_paths_allows_non_ignored_relative_path_unchanged() -> None:
+    lease = _CountingLease()
+    client_output = _Write()
+    checked: list[str] = []
+
+    def checker(path: str) -> bool:
+        checked.append(path)
+        return False
+
+    bridge = bridge_module.StdioHttpBridge(
+        _EmptyReader(),
+        client_output,
+        lambda: _identity(),
+        lambda: _identity(),
+        lease,
+        project="/checkout/project",
+        respect_ignored_paths=True,
+        ignored_path_checker=checker,
+    )
+    request = _search_request(33, relative_path="src/../allowed.txt", skip_ignored_files=True)
+
+    async def exercise() -> SessionMessage:
+        send, receive = anyio.create_memory_object_stream[SessionMessage](1)
+        async def input_messages() -> Any:
+            yield request
+        bridge._stdio_read = input_messages()
+        await bridge._read_stdio(send)
+        return await receive.receive()
+
+    queued = anyio.run(exercise)
+    assert queued is request
+    assert checked == ["/checkout/project/allowed.txt"]
+    assert client_output.sent == []
+    assert lease.started == 1
+    assert bridge._pending == {33}
+
+
+def test_disabled_guard_forwards_ignored_looking_path_without_checking() -> None:
+    lease = _CountingLease()
+    client_output = _Write()
+    checked: list[str] = []
+
+    def checker(path: str) -> bool:
+        checked.append(path)
+        return True
+
+    bridge = bridge_module.StdioHttpBridge(
+        _EmptyReader(),
+        client_output,
+        lambda: _identity(),
+        lambda: _identity(),
+        lease,
+        project="/checkout/project",
+        respect_ignored_paths=False,
+        ignored_path_checker=checker,
+    )
+    request = _search_request(34, relative_path="ignored.txt", skip_ignored_files=False)
+
+    async def exercise() -> SessionMessage:
+        send, receive = anyio.create_memory_object_stream[SessionMessage](1)
+        async def input_messages() -> Any:
+            yield request
+        bridge._stdio_read = input_messages()
+        await bridge._read_stdio(send)
+        return await receive.receive()
+
+    assert anyio.run(exercise) is request
+    assert checked == []
+    assert client_output.sent == []
+    assert lease.started == 1
+
+
+def test_enabled_guard_ignores_unrelated_symbol_tool() -> None:
+    lease = _CountingLease()
+    client_output = _Write()
+    checked: list[str] = []
+
+    def checker(path: str) -> bool:
+        checked.append(path)
+        return True
+
+    bridge = bridge_module.StdioHttpBridge(
+        _EmptyReader(),
+        client_output,
+        lambda: _identity(),
+        lambda: _identity(),
+        lease,
+        project="/checkout/project",
+        respect_ignored_paths=True,
+        ignored_path_checker=checker,
+    )
+    request = SessionMessage(
+        JSONRPCRequest(
+            jsonrpc="2.0",
+            id=35,
+            method="tools/call",
+            params={"name": "symbols/lookup", "arguments": {"relative_path": "ignored.txt"}},
+        )
+    )
+
+    async def exercise() -> SessionMessage:
+        send, receive = anyio.create_memory_object_stream[SessionMessage](1)
+        async def input_messages() -> Any:
+            yield request
+        bridge._stdio_read = input_messages()
+        await bridge._read_stdio(send)
+        return await receive.receive()
+
+    assert anyio.run(exercise) is request
+    assert checked == []
+    assert client_output.sent == []
+    assert lease.started == 1
+
+
+def test_ignored_path_checker_failure_fails_closed_with_local_error() -> None:
+    lease = _CountingLease()
+    client_output = _Write()
+
+    def checker(_path: str) -> bool:
+        raise RuntimeError("checker unavailable")
+
+    bridge = bridge_module.StdioHttpBridge(
+        _EmptyReader(),
+        client_output,
+        lambda: _identity(),
+        lambda: _identity(),
+        lease,
+        project="/checkout/project",
+        respect_ignored_paths=True,
+        ignored_path_checker=checker,
+    )
+    request = _search_request(36, relative_path="src/file.py", skip_ignored_files=True)
+
+    async def exercise() -> None:
+        send, receive = anyio.create_memory_object_stream[SessionMessage](1)
+        async def input_messages() -> Any:
+            yield request
+        bridge._stdio_read = input_messages()
+        await bridge._read_stdio(send)
+        with pytest.raises(anyio.EndOfStream):
+            await receive.receive()
+
+    anyio.run(exercise)
+    response = cast(Any, client_output.sent[-1].message)
+    assert response.id == 36
+    assert response.result["isError"] is True
+    assert "checker unavailable" in str(response.result)
+    assert lease.started == 0
+    assert bridge._pending == set()
+
+
 def test_legacy_message_passes_without_transport_metadata() -> None:
     request = JSONRPCRequest(jsonrpc="2.0", id=1, method="initialize", params={})
     original = SessionMessage(request)

@@ -13,6 +13,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 from serena_shared.runtime.models import BackendIdentity
 
+from .ignored_paths import IgnoredPathChecker
 from .protocol import (
     ActivityLease,
     activate_project,
@@ -61,6 +62,8 @@ class StdioHttpBridge:
         identity_provider: Callable[[], BackendIdentity | None],
         lease: ActivityLease,
         project: str | None = None,
+        respect_ignored_paths: bool = False,
+        ignored_path_checker: Callable[[str], bool] | None = None,
     ) -> None:
         self._stdio_read = stdio_read
         self._stdio_write = stdio_write
@@ -68,6 +71,11 @@ class StdioHttpBridge:
         self._identity_provider = identity_provider
         self._lease = lease
         self._project = project
+        self._ignored_path_checker = (
+            IgnoredPathChecker(project or "", ignored_path_checker)
+            if respect_ignored_paths
+            else None
+        )
         self._initialize: SessionMessage | None = None
         self._initialized: SessionMessage | None = None
         self._activated_identity: BackendIdentity | None = None
@@ -92,6 +100,8 @@ class StdioHttpBridge:
                     self._initialize = item
                 elif method == "notifications/initialized":
                     self._initialized = item
+                if await self._reject_ignored_path_request(item):
+                    continue
                 request_id = message_id(item)
                 if method is not None and request_id is not None:
                     self._lease.request_started()
@@ -285,6 +295,17 @@ class StdioHttpBridge:
         finally:
             if attempt.reconnect_item is None:
                 group.cancel_scope.cancel()
+
+    async def _reject_ignored_path_request(self, item: SessionMessage) -> bool:
+        if self._ignored_path_checker is None:
+            return False
+        rejection = await run_sync_in_worker_thread(
+            self._ignored_path_checker.rejection_for, item
+        )
+        if rejection is None:
+            return False
+        await self._stdio_write.send(rejection)
+        return True
 
     async def _queue_transport_barrier(
         self,

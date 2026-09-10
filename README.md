@@ -62,9 +62,10 @@ discovery cannot provide an equivalent tool surface.
 
 ## CLI and Serena pass-through
 
-The wrapper owns only the `proxy` and `status` commands, `--profile-key`, and
-`--idle-timeout-minutes`. It does not inject a Serena context, mode, dashboard,
-browser, onboarding, or memories setting: Serena's native defaults apply.
+The wrapper owns only the `proxy` and `status` commands, `--profile-key`,
+`--idle-timeout-minutes`, and `--respect-ignored-paths`. It does not inject a
+Serena context, mode, dashboard, browser, onboarding, or memories setting:
+Serena's native defaults apply.
 
 Pass Serena arguments after an explicit `--` separator:
 
@@ -72,7 +73,25 @@ Pass Serena arguments after an explicit `--` separator:
 serena-shared proxy
 serena-shared proxy -- --context desktop-app
 serena-shared proxy --profile-key readonly -- --context ./readonly.yml
+serena-shared proxy --respect-ignored-paths
 ```
+
+`--respect-ignored-paths` is opt-in and local to that proxy process; it does
+not alter Serena configuration, the backend identity, or its profile. It
+rejects only `search_for_pattern` calls: `skip_ignored_files: false` is always
+rejected, and a string `relative_path` is rejected when that selected base path
+is ignored. A search that omits `relative_path` remains allowed. Other tools
+and searches are forwarded unchanged.
+
+For each checked path the proxy resolves `serena` from its own `PATH` and runs
+`serena project is_ignored_path PATH PROJECT`, so Serena's effective global,
+project, and Git ignore matcher decides the result. This adds one subprocess per
+checked call; a backend previously started by a client with a different `PATH`
+may be a different Serena installation. The output parser intentionally pins
+the current Serena CLI wording and fails closed if it changes, Serena cannot be
+executed, or the check fails. Each check has a 10-second subprocess timeout,
+after which it also fails closed. This guard is not a memory ceiling or general
+resource-governance mechanism.
 
 The wrapper rejects these Serena tail flags because it owns the checkout and
 loopback transport: `--project`, `--project-file`, `--project-from-cwd`,
