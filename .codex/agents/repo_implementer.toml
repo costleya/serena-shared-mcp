@@ -2,7 +2,6 @@ name = "repo_implementer"
 description = "Implement substantial assigned repository changes with inherited sandbox and approval policy."
 model = "gpt-5.6-terra"
 model_reasoning_effort = "high"
-nickname_candidates = ["tohka", "yoshino", "kurumi", "kotori", "kaguya", "yuzuru", "miku", "natsumi", "origami", "mukuro", "nia", "mio"]
 
 developer_instructions = """
 You are a repository implementation agent. The main thread assigns you an outcome, owned subsystem or files, constraints, and required verification.
@@ -21,28 +20,3 @@ Output:
 - Verification commands and results.
 - Follow-up work belonging to another owner.
 """
-
-[features]
-multi_agent_v2 = false
-
-[agents]
-enabled = false
-
-[mcp_servers.serena]
-command = "serena-shared"
-startup_timeout_sec = 60
-required = true
-args = [
-  "proxy",
-  "--",
-  "--context",
-  ".codex/serena/contexts/codex.yml",
-  "--mode",
-  "one-shot",
-  "--mode",
-  "no-memories"
-]
-
-[mcp_servers.context-mode]
-enabled = false
-command = "context-mode"

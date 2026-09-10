@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Task Execution and Communication
+
+Carry authorized work through implementation and verification. Resolve questions from repository evidence before asking the user; ask only when missing information materially changes the outcome. Respect collaboration mode and permission boundaries. Keep updates concise and report findings, verification, and material limitations.
+
 ## Project Structure & Module Organization
 
 This Python 3.14 package uses a `src/` layout. In `src/serena_shared/`, `cli.py` defines the command, `lifecycle.py` manages checkout state, and `transport.py` bridges stdio to Serena HTTP. Packaged configuration is under `resources/`; tests are in `tests/`. Do not commit `dist/` artifacts.
@@ -21,43 +25,43 @@ Use four-space indentation, `snake_case` functions, `PascalCase` classes, and `U
 
 ## Testing Guidelines
 
+For documentation, instructions, or tool configuration only, check relevant formatting, parse changed configuration, and review instruction consistency. Do not run application tests or builds unless behavior changes.
+
 Use pytest and name files/functions `test_*.py` and `test_*`. Add focused regression tests beside the affected module. Use `tmp_path` and monkeypatching; never depend on live Serena state. Gate tests requiring sockets or process inspection as integrations. Branch coverage is enabled without a numeric threshold.
 
 ## Code Navigation
 
 Use repository-local code intelligence before broad source inspection. Start with GrepAI when behavior, flow, or file ownership is unknown; it runs in single-project mode, so call searches without a workspace or project argument. Use Serena for known symbols, references, implementations, diagnostics, and scoped edits. Use targeted `rg` searches for literal strings, filenames, configuration, and generated files. If a semantic tool fails, retry once with a corrected request before falling back.
 
-## Multi-Agent Workflow
+## Subagent Orchestration
 
-The main task coordinates work, synthesizes evidence, and owns final acceptance. Use subagents enthusiastically for any non-trivial task that can be divided into independent investigation, implementation, testing, verification, or review work. Agent capacity is inexpensive: prefer useful parallel fan-out over making the main task perform every step serially. Handle only genuinely small, obvious, single-owner work directly. Give every agent an explicit outcome, ownership boundary, constraints, and expected evidence.
-
-For every named specialist spawn, explicitly set `fork_turns = "none"`. Its prompt must stand on its own and state the objective, ownership, constraints, relevant paths, and expected output; never rely on parent-thread history.
+Use the main thread as coordinator, synthesis owner, and final acceptance owner. Delegate independent work when it reduces completion time or improves evidence or review quality. Handle small, single-owner work directly.
 
 ### Role Routing
 
-| Role               | Responsibility                                                                                       |
-| ------------------ | ---------------------------------------------------------------------------------------------------- |
-| `repo_explorer`    | Trace unfamiliar behavior, dependencies, risks, and likely edit surfaces without writing.            |
-| `researcher`       | Find current primary-source evidence for Python, MCP, Serena, packaging, or platform questions.      |
-| `repo_implementer` | Change production code and package configuration within an assigned scope.                           |
-| `test_implementer` | Independently author pytest tests, fixtures, mocks, and test configuration.                          |
-| `test_runner`      | Verify the integrated worktree after all relevant writers finish; never repair failures.             |
-| `code_reviewer`    | Review completed changes for correctness, regressions, process safety, compatibility, and test gaps. |
+| Role | Responsibility |
+| --- | --- |
+| `repo_explorer` | Read-only discovery of unfamiliar behavior, dependencies, risks, and edit surfaces. |
+| `researcher` | Current primary-source evidence for Python, MCP, Serena, packaging, and platforms. |
+| `repo_implementer` | Production code and package configuration within an assigned scope. |
+| `test_implementer` | Independent pytest tests, fixtures, mocks, and test configuration. |
+| `test_runner` | Post-integration verification after all relevant writers finish, without repairs. |
+| `code_reviewer` | Routine independent review at Sol Medium before acceptance. |
+| `code_reviewer_deep` | Materially high-risk process safety, concurrency, lifecycle, transport, or architectural review at Astra Medium. |
 
-Multiple agents of the same role are encouraged when the work divides cleanly. Fan out several `repo_explorer` or `researcher` agents across independent questions, source domains, or repository areas; assign multiple implementers to disjoint production surfaces; split tests by layer or feature; and use independent runners or reviewers when separate commands, risk areas, or confidence checks justify it. Identical assignments are acceptable for deliberate replication, competing approaches, or confidence checks. The main task reconciles results and resolves conflicts.
+### Workflow Rules
 
-### Orchestration Rules
+1. **Delegate independent work early.** Dispatch useful, stable, non-overlapping assignments concurrently. Sequence work with real dependencies; avoid duplicate investigation unless deliberate independent replication resolves a concrete uncertainty.
+2. **Define ownership and contracts.** State the objective, acceptance criteria, public behavior, owned files or symbols, constraints, relevant paths, and expected evidence. For every named specialist spawn, explicitly set `fork_turns = "none"` and provide a standalone prompt.
+3. **Route by responsibility.** Keep production implementation, test authoring, verification, and review ownership separate. The main thread coordinates rather than duplicates active assignments.
+4. **Separate ownership.** Multiple agents of the same role may own disjoint scopes. Never assign simultaneous writers to the same file or symbol. Preserve unrelated user and agent edits.
+5. **Honor assignment lifecycle.** A wait timeout or absence of edits is not evidence that an agent is stuck. Continue independent work, send bounded status requests when useful, and return repair work to its owner with `followup_task`. Interrupt only for cancellation, unsafe actions, ownership conflicts, material scope corrections, or reported blockers. Inspect partial work before reassignment.
+6. **Parallelize stable production and tests.** Author concurrently when contracts are stable and ownership is disjoint; otherwise establish the contract first. Test authors working alongside production may check syntax or harness setup, but must treat behavioral results as provisional and report the final command for the runner.
+7. **Enforce an integration barrier.** Wait for all relevant writers before final verification. Use one `test_runner` for the complete integrated gate after parallel writing or for broad, slow, or artifact-producing checks. A small focused check may remain with the main thread. Runners report evidence and likely ownership; repair returns to the writer.
+8. **Review by risk domain.** Use one `code_reviewer` for routine non-trivial integrated changes, or `code_reviewer_deep` for materially high-risk work. Add reviewers only for clearly disjoint evidence and risk domains. Return corrections to the same reviewer and let the main thread resolve disagreements.
+9. **Keep ownership bounded.** Specialists follow their role's delegation rules and stay within the assignment. Use fresh agents for unrelated follow-on work or a material architectural pivot, with a concise current-state handoff.
 
-1. **Fan out early.** For non-trivial work, actively look for independent repository questions, external questions, implementation surfaces, test layers, verification commands, and review concerns. Dispatch all stable, non-overlapping work concurrently instead of waiting for one agent to finish before finding the next assignment.
-2. **Define ownership and contracts.** State acceptance criteria, public behavior, owned files or symbols, prohibited scope, and required verification. Use `fork_turns = "none"` for named specialists and make prompts self-contained.
-3. **Use the full role set.** Use `repo_explorer` for repository uncertainty and `researcher` for external uncertainty. Delegate production changes to `repo_implementer`, test changes to `test_implementer`, integrated verification to `test_runner`, and non-trivial acceptance review to `code_reviewer`. The main task should coordinate and synthesize rather than duplicate assigned work.
-4. **Separate ownership and multiply agents safely.** Production files belong to one or more `repo_implementer` agents with disjoint scopes; tests and test infrastructure belong to one or more `test_implementer` agents with disjoint scopes. Agents of the same type are welcome, but no two writers may own the same file or symbol unless the assignment explicitly calls for alternative patches rather than simultaneous edits.
-5. **Parallelize stable work aggressively.** Production and tests should be authored concurrently whenever acceptance criteria and public contracts are stable and file ownership is disjoint. Independent production modules, test layers, research questions, verification commands, and review dimensions should also run in parallel. Sequence only work with a real dependency.
-6. **Treat pre-integration results as provisional.** A test author working alongside production may validate syntax and harness setup, but must defer behavioral conclusions and report the exact final command.
-7. **Enforce an integration barrier.** Wait for every writing agent to finish before final verification. Use one or more `test_runner` agents after parallel writers, or whenever checks are broad, slow, artifact-producing, independently runnable, or worth repeating. A small focused check may remain with the main task.
-8. **Review from multiple angles.** Send non-trivial integrated changes and verification evidence to `code_reviewer`. For broad or high-risk changes, use multiple reviewers with distinct concerns such as correctness, compatibility, process safety, and test adequacy. Route findings back to the correct owner, rerun affected checks, and let the main task resolve disagreements against the stated requirements.
-
-Test runners report commands, exit status, evidence, and likely ownership; they do not diagnose deeply or edit source. Reviewers produce actionable findings, not implementation. No specialist may delegate further or expand beyond its assignment.
+MCP servers and permissions are inherited from the parent task. Configure shared MCP servers in `.codex/config.toml`; role files define models, reasoning, instructions, and supported feature reductions. Read-only and external-research responsibilities are instruction-level contracts, not role-specific MCP or filesystem isolation.
 
 ## Git
 

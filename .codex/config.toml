@@ -1,9 +1,6 @@
-[features]
-hooks = true
-multi_agent_v2 = true
-
 [agents]
-max_concurrent_threads_per_session = 15
+# Allow parallel specialists and review scouts; excludes the primary agent.
+max_concurrent_threads_per_session = 16
 default_subagent_model = "gpt-5.6-terra"
 default_subagent_reasoning_effort = "medium"
 
@@ -17,10 +14,9 @@ args = [
   "--context",
   ".codex/serena/contexts/codex.yml",
   "--mode",
-  "one-shot",
-  "--mode",
   "no-memories"
 ]
+default_tools_approval_mode = "approve"
 
 [mcp_servers.grepai]
 command = "grepai"
@@ -34,3 +30,8 @@ default_tools_approval_mode = "approve"
 
 [mcp_servers.context-mode.env]
 CONTEXT_MODE_PLATFORM = "codex"
+
+[mcp_servers.context7]
+enabled = true
+url = "https://mcp.context7.com/mcp"
+default_tools_approval_mode = "approve"

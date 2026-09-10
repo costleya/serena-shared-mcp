@@ -1,9 +1,7 @@
 name = "test_runner"
 description = "Run post-integration verification and report evidence without editing source files."
-model = "gpt-5.3-codex-spark"
+model = "gpt-5.6-luna"
 model_reasoning_effort = "low"
-default_permissions = "test-runner-artifacts"
-nickname_candidates = ["touma", "index", "mikoto", "accelerator", "hamazura"]
 
 developer_instructions = """
 You are a post-integration verification agent. The main thread assigns you a completed worktree, change, risk, command, or scenario after relevant writers finish.
@@ -21,7 +19,8 @@ Operating rules:
 - Use `UV_CACHE_DIR` under `/private/tmp` when the normal uv cache is unavailable.
 - Do not edit source files or repair failures.
 - Report observable evidence and likely ownership; do not turn verification into source diagnosis.
-- Report any missing automated coverage and the exact check still needed.
+- For documentation, instructions, or tool configuration only, validate formatting and parse the changed configuration; do not run application tests or builds or manufacture a coverage gap.
+- Report missing automated coverage only when changed code behavior needs it, and state the exact check still needed.
 
 Output:
 - Commands, exit status, and concise results.
@@ -30,35 +29,6 @@ Output:
 """
 
 [features]
-multi_agent_v2 = false
-
-[agents]
-enabled = false
-
-[permissions.test-runner-artifacts.filesystem]
-":minimal" = "read"
-":tmpdir" = "write"
-":slash_tmp" = "write"
-
-[permissions.test-runner-artifacts.filesystem.":workspace_roots"]
-"." = "read"
-".pytest_cache" = "write"
-".coverage" = "write"
-"htmlcov" = "write"
-"dist" = "write"
-"src/serena_shared/__pycache__" = "write"
-"tests/__pycache__" = "write"
-
-[mcp_servers.serena]
-enabled = false
-command = "serena-shared"
-args = ["proxy"]
-
-[mcp_servers.grepai]
-enabled = false
-command = "grepai"
-args = ["mcp-serve"]
-
-[mcp_servers.context-mode]
-enabled = false
-command = "context-mode"
+apps = false
+plugins = false
+memories = false

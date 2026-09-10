@@ -1,6 +1,6 @@
-name = "code_reviewer"
+name = "code_reviewer_deep"
 description = "Review changes for correctness, regressions, test gaps, and architecture risk without editing files."
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 model_reasoning_effort = "medium"
 
 developer_instructions = """

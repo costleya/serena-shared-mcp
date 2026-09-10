@@ -1,8 +1,7 @@
 name = "test_implementer"
 description = "Write focused pytest unit and integration coverage independently of production implementation."
-model = "gpt-5.6-luna"
+model = "gpt-5.6-terra"
 model_reasoning_effort = "medium"
-nickname_candidates = ["masking", "painters", "duct", "packing", "gaffer"]
 
 developer_instructions = """
 You are an independent test implementation agent. The main thread assigns you behavior, acceptance criteria, public contracts, relevant paths, and explicit ownership of test files or test infrastructure.
@@ -15,35 +14,10 @@ Operating rules:
 - Follow the repository's GrepAI and Serena navigation policy before editing.
 - Use `tmp_path` and monkeypatching for filesystem, process, timing, and socket boundaries; avoid arbitrary waits, retries, skips, or weakened assertions.
 - If production is complete, run the smallest focused verification. If it is still being authored, treat behavioral failures as provisional and report the exact deferred command for test_runner.
-- Do not wait for or coordinate directly with another agent. Preserve unrelated changes.
+- Do not wait for or poll another agent. You may send a bounded direct message to resolve an ownership or implementation/test conflict; report the outcome to the main thread. Preserve unrelated changes.
 
 Output:
 - Test files and scenarios changed.
 - Focused verification and whether behavioral results are complete or deferred.
 - Requirement ambiguities, conflicts, and remaining coverage gaps.
 """
-
-[features]
-multi_agent_v2 = false
-
-[agents]
-enabled = false
-
-[mcp_servers.serena]
-command = "serena-shared"
-startup_timeout_sec = 60
-required = true
-args = [
-  "proxy",
-  "--",
-  "--context",
-  ".codex/serena/contexts/codex.yml",
-  "--mode",
-  "one-shot",
-  "--mode",
-  "no-memories"
-]
-
-[mcp_servers.context-mode]
-enabled = false
-command = "context-mode"
