@@ -14,7 +14,8 @@ args = [
   "--context",
   ".codex/serena/contexts/codex.yml",
   "--mode",
-  "no-memories"
+  "no-memories",
+  "--respect-ignored-paths"
 ]
 default_tools_approval_mode = "approve"
 
